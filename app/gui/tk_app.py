@@ -40,7 +40,14 @@ class QuintDeepflowApp(tk.Tk):
             "yes",
             "on",
         }
-        self.title(version_label("QUINTdeepflow2"))
+        self.app_title = str(os.environ.get("QUINTDEEPFLOW_GUI_TITLE", "QUINTdeepflow2")).strip() or "QUINTdeepflow2"
+        self.input_json_label = str(os.environ.get("QUINTDEEPFLOW_INPUT_JSON_LABEL", "3. Atlas JSON")).strip() or "3. Atlas JSON"
+        self.input_json_check_label = (
+            str(os.environ.get("QUINTDEEPFLOW_INPUT_JSON_CHECK_LABEL", "Atlas JSON Check")).strip()
+            or "Atlas JSON Check"
+        )
+        self.input_json_short_label = "Input JSON" if "Input JSON" in self.input_json_label else "Atlas JSON"
+        self.title(version_label(self.app_title))
         self.geometry(self.WINDOW_GEOMETRY)
         self.minsize(*self.WINDOW_MINSIZE)
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -121,7 +128,7 @@ class QuintDeepflowApp(tk.Tk):
             self.segmentation_folder_var,
             self._browse_segmentation_folder,
         )
-        self._file_row(config_frame, 2, "3. Atlas JSON", self.atlas_json_var, self._browse_atlas_json)
+        self._file_row(config_frame, 2, self.input_json_label, self.atlas_json_var, self._browse_atlas_json)
         self._path_row(config_frame, 3, "4. Output folder", self.output_folder_var, self._browse_output_folder)
         self._simple_row(config_frame, 4, "5. Output sample name", self.sample_name_var)
 
@@ -164,7 +171,7 @@ class QuintDeepflowApp(tk.Tk):
         for text, command in (
             ("Load Config", self._load_config_dialog),
             ("Save Config", self._save_config_dialog),
-            ("Atlas JSON Check", self._discover),
+            (self.input_json_check_label, self._discover),
             ("Run", self._run_pipeline),
             ("Open Results", self._open_results),
             ("Export Portable", self._export_portable_bundle),
@@ -177,7 +184,7 @@ class QuintDeepflowApp(tk.Tk):
         body.rowconfigure(0, weight=3, minsize=360)
         body.rowconfigure(1, weight=1)
 
-        table_frame = ttk.LabelFrame(body, text="Atlas JSON Check / Resolved Bundles")
+        table_frame = ttk.LabelFrame(body, text=f"{self.input_json_check_label} / Resolved Bundles")
         table_frame.grid(row=0, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
@@ -900,7 +907,7 @@ class QuintDeepflowApp(tk.Tk):
         if not self.segmentation_folder_var.get().strip():
             missing.append("ilastik segmentation folder")
         if not self.atlas_json_var.get().strip():
-            missing.append("Atlas JSON")
+            missing.append(self.input_json_short_label)
         if not self.output_folder_var.get().strip():
             missing.append("Output folder")
         if not self.sample_name_var.get().strip():
@@ -945,17 +952,17 @@ class QuintDeepflowApp(tk.Tk):
             groups = discover_section_groups(self._collect_config())
             frame = discovery_to_dataframe(groups)
         except Exception as exc:
-            messagebox.showerror("Atlas JSON check failed", str(exc))
-            self._append_log(f"Atlas JSON check failed: {exc}")
+            messagebox.showerror(f"{self.input_json_short_label} check failed", str(exc))
+            self._append_log(f"{self.input_json_short_label} check failed: {exc}")
             return
         self._populate_tree(frame)
-        self._append_log(f"Atlas JSON check found {len(frame)} bundle(s)")
+        self._append_log(f"{self.input_json_short_label} check found {len(frame)} bundle(s)")
 
     def _run_pipeline(self) -> None:
         if not self._validate_required_inputs():
             return
         if self._worker_thread and self._worker_thread.is_alive():
-            messagebox.showinfo("Run in progress", "QUINTdeepflow2 is already processing this dataset.")
+            messagebox.showinfo("Run in progress", f"{self.app_title} is already processing this dataset.")
             return
         config = self._collect_config()
         output_dir = config.output.output_dir.resolve()
@@ -1024,7 +1031,7 @@ class QuintDeepflowApp(tk.Tk):
             keep_running = messagebox.askyesno(
                 "Processing in progress",
                 "Quantification is still running.\n\n"
-                "If you close this window now, QUINTdeepflow2 will keep processing in the background "
+                f"If you close this window now, {self.app_title} will keep processing in the background "
                 "until cell_level.csv and the other output files are finished.\n\n"
                 "Close the window anyway?",
             )

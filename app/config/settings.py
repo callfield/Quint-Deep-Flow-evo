@@ -14,13 +14,13 @@ import yaml
 class AtlasConfig:
     """Atlas-related settings."""
 
-    name: str = "allen_mouse_ccfv3_2017_10um"
-    labels_path: Path = Path("../../atlas_cache/allen_ccf/annotation_10.nrrd")
-    tree_path: Path = Path("../../QCAlign-v0.8/ABA_Mouse_CCFv3_2017_25um.cutlas/tree.json")
-    labels_txt_path: Path = Path("../../QCAlign-v0.8/ABA_Mouse_CCFv3_2017_25um.cutlas/labels.txt")
+    name: str = "allen_mouse_ccfv3_2017_25um"
+    labels_path: Path = Path("../atlas/ccf/annotation_25.nrrd")
+    tree_path: Path = Path("../atlas/ccf/tree.json")
+    labels_txt_path: Path = Path("../atlas/ccf/labels.txt")
     registered_section_cache_dir: Path = Path("./atlas_cache/registered_sections")
-    voxel_size_um: float = 10.0
-    quicknii_resolution_vox: tuple[int, int, int] = (1140, 1320, 800)
+    voxel_size_um: float = 25.0
+    quicknii_resolution_vox: tuple[int, int, int] = (456, 528, 320)
     allen_bregma_um: tuple[float, float, float] = (5400.0, 0.0, 5700.0)
     stereotactic_tilt_deg: float = 0.0
     dv_scale: float = 1.0

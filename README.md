@@ -1,13 +1,28 @@
 # Quint Deep Flow evo
 
-Quint Deep Flow evo is a two-step desktop workflow for mouse brain section atlas fitting.
+Quint Deep Flow evo is a three-step desktop workflow for mouse brain section atlas fitting and quantification.
 
 It contains:
 
 - `QDFevo_1_Align`: AP-limited DeepSlice alignment from TIFF section images.
 - `QDFevo_2_AtlasFitter`: manual atlas fitting, marker-based local adjustment, and omit-region editing.
+- `QDFevo_3_Quantitate`: cell quantification from `QDFevo_2_AtlasFitter` output, including omit-mask aware summaries.
 
 The repository includes one small demo slice under `demo/one_slice`.
+
+## Functions
+
+### QDFevo_1_Align
+
+`QDFevo_1_Align` estimates the AP position and initial atlas alignment for brain section images with DeepSlice. Adding an AP hint CSV lets the workflow restrict AP estimation to a user-defined range, which is useful when the expected section level is already known. For robust regional position estimation, DAPI-stained section images are recommended.
+
+### QDFevo_2_AtlasFitter
+
+`QDFevo_2_AtlasFitter` lets users intuitively manually refine the brain slice position estimated by `QDFevo_1_Align`. It supports AP position, image rotation, atlas size, and center-position transforms, marker-based intuitive non-linear fitting, and omit-region editing for damaged or contaminated areas that should be partially excluded from later analysis.
+
+### QDFevo_3_Quantitate
+
+`QDFevo_3_Quantitate` performs cell quantification using the edited JSON and omit masks produced by `QDFevo_2_AtlasFitter`. Omit regions are treated as masks: cells overlapping the mask are flagged/excluded from summary counts, and region area is reduced only by the masked pixels rather than removing the entire atlas region.
 
 ## GUI screenshots
 
@@ -27,6 +42,8 @@ The input paths and log messages shown below are sanitized for public documentat
 launch_QDFevo_1_Align.bat          Start QDFevo_1_Align on Windows
 launch_QDFevo_2_AtlasFitter.bat    Start QDFevo_2_AtlasFitter on Windows
 launch_QDFevo_2.bat                Short alias for QDFevo_2_AtlasFitter
+launch_QDFevo_3_Quantitate.bat     Start QDFevo_3_Quantitate on Windows
+launch_QDFevo_3.bat                Short alias for QDFevo_3_Quantitate
 app/                               Python GUI and processing code
 atlas/ccf/                         Minimal Allen CCF metadata/annotation for demo display
 demo/one_slice/                    One-slice demo data
@@ -65,6 +82,8 @@ From Explorer, double-click:
 launch_QDFevo_1_Align.bat
 launch_QDFevo_2_AtlasFitter.bat
 launch_QDFevo_2.bat
+launch_QDFevo_3_Quantitate.bat
+launch_QDFevo_3.bat
 ```
 
 Or from PowerShell:
@@ -73,6 +92,8 @@ Or from PowerShell:
 .\launch_QDFevo_1_Align.bat
 .\launch_QDFevo_2_AtlasFitter.bat
 .\launch_QDFevo_2.bat
+.\launch_QDFevo_3_Quantitate.bat
+.\launch_QDFevo_3.bat
 ```
 
 If no portable runtime is found, the launchers fall back to `python` on `PATH`. In that case, activate your virtual environment first:
@@ -115,6 +136,21 @@ demo\one_slice\qdf2_atlasfitter\jpg\QDFevo_demo_one_slice.json
 4. The adjacent image `505A_XY01_CH3.jpg` is loaded automatically.
 5. Use pan/marker/omit tools to inspect or edit the atlas fit.
 6. Click `Save JSON` to write changes. Omit edits are saved beside the JSON as `*_omit_state.json` and `*_omitMasks`.
+
+## QDFevo_3_Quantitate outputs
+
+`QDFevo_3_Quantitate` takes raw images, ilastik/segmentation masks, and the edited `QDFevo_2_AtlasFitter` JSON as input. The main output folder contains:
+
+- `cell_level.csv`: per-cell quantification table. When omit masks are applied, `omit_flag` and `omit_source` identify cells overlapping omitted areas.
+- `region_summary.csv`: per-region cell counts, intensity summaries, area, density, and overlap-set summaries after excluding omitted cells and subtracting masked area.
+- `section_summary.csv`: per-section summary generated from non-omitted cells.
+- `processing_log.csv`: processing status, timing, and errors for each section/channel.
+- `discovery_table.csv`: matched raw image, segmentation mask, and atlas JSON inputs.
+- `atlas_display_codebook.csv`: atlas display-code lookup used in overlays.
+- `overlay/*_overlay_full.tiff`: multi-plane overlay image including raw image, cell ROI, atlas outline/display code, and `omit_region_mask`.
+- `overlay/*_multichannel_channel_maps.xlsx`: plane map describing each overlay TIFF channel.
+- `qdf1_atlasfitter_imported_omit_regions.csv`: reference report of atlas patches touched by imported omit masks.
+- `qdf1_atlasfitter_imported_omit_session.yaml`: QDF3-compatible reference session generated from imported omit masks.
 
 ## What to be careful about
 

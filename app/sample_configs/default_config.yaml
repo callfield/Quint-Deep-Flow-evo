@@ -1,8 +1,8 @@
 atlas:
   name: allen_mouse_ccfv3_2017_25um
-  labels_path: atlas/ccf/annotation_25.nrrd
-  tree_path: atlas/ccf/tree.json
-  labels_txt_path: atlas/ccf/labels.txt
+  labels_path: ../../atlas/ccf/annotation_25.nrrd
+  tree_path: ../../atlas/ccf/tree.json
+  labels_txt_path: ../../atlas/ccf/labels.txt
   voxel_size_um: 25.0
   quicknii_resolution_vox: [456, 528, 320]
   allen_bregma_um: [5400.0, 0.0, 5700.0]
@@ -10,23 +10,73 @@ atlas:
   dv_scale: 1.0
 
 discovery:
-  project_root: demo/one_slice
-  animal_include: []
-  channel_include: []
-  section_include: []
-  image_subdir_name: raw
-  mask_subdir_candidates: [ilastik, mask, masks]
-  mask_filename_globs: ["*Simple Segmentation*.png", "*Simple_Segmentation*.png", "*.png", "*.tif", "*.tiff"]
+  project_root: ""
+  animal_include: [505A]
+  channel_include: [cfos]
+  section_include: [XY01]
+  image_subdir_name: png
+  mask_subdir_candidates: [ilastik, ilastik/glansbayPNGconverted, mask, masks]
+  mask_filename_globs: ["*Simple Segmentation*.png", "*Simple_Segmentation*.png", "*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff"]
   registration_subdir_candidates: [jpg]
-  registration_filename_globs: ["*.json"]
+  registration_filename_globs: ["*VA*.json", "*QuickNII*.json", "*.json"]
   existing_result_subdir_candidates: [result, results]
   recursive_channel_search: false
 
 processing:
+  mask_threshold: 1
+  min_component_area_px: 9
+  analysis_image_channels: [CH2]
+  registration_image_channel: CH2
+  per_channel_min_area_px: {CH1: 12, CH2: 9, CH3: 9, CH4: 9}
+  per_channel_mask_threshold: {}
+  hemisphere_midline_threshold_um: 75.0
   coordinate_unit: mm
+  region_smoothing_enabled: true
+  region_smoothing_kernel_size: 7
+  region_smoothing_iterations: 2
+  region_smoothing_downsample_factor: 3
+  atlas_sampling_mode: local_signed_distance
+  atlas_sampling_radius_vox: 2
+  atlas_sampling_batch_size: 4096
+  include_region_fill_in_preview: false
+  overlay_enabled: true
+  overlay_preview_max_size: 1400
+  overlay_draw_masks: false
+  overlay_draw_centroids: true
+  combined_overlay_enabled: true
+  combined_overlay_draw_masks: true
+  combined_overlay_draw_centroids: true
+  overlay_channel_colors:
+    CH1: [90, 220, 255]
+    CH2: [255, 110, 110]
+    CH3: [130, 255, 150]
+    CH4: [255, 195, 90]
   overlay_chunk_rows: 256
 
+matching:
+  enabled: true
+  method: centroid_distance
+  distance_threshold_px: 25.0
+  iou_threshold: 0.15
+  overlap_threshold_px: 25
+  combinations: []
+  pair_rules: {}
+
+comparison:
+  enabled: false
+  max_mean_nn_distance_um_warning: 150.0
+  max_abs_count_delta_warning: 20
+
+reference:
+  enabled: false
+  prefer_existing_overlay_if_available: false
+  prefer_reference_summary_if_available: false
+  export_reference_cell_level: false
+  overlay_alpha: 0.28
+  mode_filter_size: 5
+  roi_number_min_area_px: 20000
+
 output:
-  output_root: outputs
-  run_name: demo
+  output_root: ../outputs
+  run_name: single_section_demo
   save_resolved_config: true
