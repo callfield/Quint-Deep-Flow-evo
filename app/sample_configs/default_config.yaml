@@ -1,0 +1,32 @@
+atlas:
+  name: allen_mouse_ccfv3_2017_25um
+  labels_path: atlas/ccf/annotation_25.nrrd
+  tree_path: atlas/ccf/tree.json
+  labels_txt_path: atlas/ccf/labels.txt
+  voxel_size_um: 25.0
+  quicknii_resolution_vox: [456, 528, 320]
+  allen_bregma_um: [5400.0, 0.0, 5700.0]
+  stereotactic_tilt_deg: 0.0
+  dv_scale: 1.0
+
+discovery:
+  project_root: demo/one_slice
+  animal_include: []
+  channel_include: []
+  section_include: []
+  image_subdir_name: raw
+  mask_subdir_candidates: [ilastik, mask, masks]
+  mask_filename_globs: ["*Simple Segmentation*.png", "*Simple_Segmentation*.png", "*.png", "*.tif", "*.tiff"]
+  registration_subdir_candidates: [jpg]
+  registration_filename_globs: ["*.json"]
+  existing_result_subdir_candidates: [result, results]
+  recursive_channel_search: false
+
+processing:
+  coordinate_unit: mm
+  overlay_chunk_rows: 256
+
+output:
+  output_root: outputs
+  run_name: demo
+  save_resolved_config: true
