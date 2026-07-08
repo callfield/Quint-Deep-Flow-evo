@@ -9,6 +9,18 @@ It contains:
 
 The repository includes one small demo slice under `demo/one_slice`.
 
+## GUI screenshots
+
+The input paths and log messages shown below are sanitized for public documentation.
+
+### QDFevo_1_Align
+
+![QDFevo_1_Align GUI](docs/images/qdfevo-1-align-gui.png)
+
+### QDFevo_2_AtlasFitter
+
+![QDFevo_2_AtlasFitter GUI](docs/images/qdfevo-2-atlasfitter-gui.png)
+
 ## Repository layout
 
 ```text

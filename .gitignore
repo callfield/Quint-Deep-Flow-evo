@@ -15,6 +15,7 @@ rt/
 portable_runtime/
 atlas/ccf/*__quintnext_cache.raw
 app/sample_configs/atlas_cache/
+app/.*_browse_history.json
 demo/**/jpgDS_results*
 demo/**/QDFevo1_results*
 demo/**/.deepslice_*
