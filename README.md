@@ -108,8 +108,14 @@ demo\one_slice\qdf2_atlasfitter\jpg\QDFevo_demo_one_slice.json
 
 - `QDFevo_1_Align` needs a DeepSlice-capable environment. The regular Python dependencies in `requirements.txt` are not enough for DeepSlice prediction.
 - The demo data are reduced to one section and should not be treated as a full validation dataset.
-- This repository currently has no open-source license. Add a license before public reuse/distribution if needed.
-- Confirm that you are allowed to redistribute any atlas files and demo images before making the repository public.
+- The source code is released under the MIT License.
+- Atlas files and demo image data may be subject to their original data-source terms and are not relicensed by the MIT License unless explicitly permitted by their original providers.
+
+## License
+
+The source code in this repository is licensed under the MIT License. See `LICENSE`.
+
+Atlas files, demo images, and other third-party or experimental data remain subject to their original data-source terms.
 
 ## GitHub publication
 
