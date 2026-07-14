@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field, replace
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -101,6 +102,7 @@ class AtlasFittingApp(tk.Tk):
         self.space_opacity_factor = 0.30
         self.preview_note_var = tk.StringVar(value="")
         self.hover_region_var = tk.StringVar(value="")
+        self.display_channel_var = tk.StringVar(value="Auto(JSON)")
         self.marker_mode_var = tk.StringVar(value="pan")
         self.omit_draw_mode_var = tk.StringVar(value="brush")
         self.omit_brush_px_var = tk.DoubleVar(value=150.0)
@@ -126,6 +128,7 @@ class AtlasFittingApp(tk.Tk):
         self.current_base_photo: ImageTk.PhotoImage | None = None
         self.current_atlas_photo: ImageTk.PhotoImage | None = None
         self.current_omit_photo: ImageTk.PhotoImage | None = None
+        self.current_display_image_path: Path | None = None
         self._current_atlas_alpha: np.ndarray | None = None
         self._current_boundary_points: np.ndarray | None = None
         self._current_boundary_alpha_values: np.ndarray | None = None
@@ -306,6 +309,16 @@ class AtlasFittingApp(tk.Tk):
             foreground="#4c5a6a",
             wraplength=self.SIDE_PANEL_WIDTH - 28,
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        ttk.Label(nav, text="Display CH").grid(row=2, column=0, sticky="w", padx=8, pady=(0, 6))
+        self.display_channel_combo = ttk.Combobox(
+            nav,
+            state="readonly",
+            values=["Auto(JSON)", "CH1", "CH2", "CH3", "CH4"],
+            textvariable=self.display_channel_var,
+            width=12,
+        )
+        self.display_channel_combo.grid(row=2, column=1, sticky="w", padx=6, pady=(0, 6))
+        self.display_channel_combo.bind("<<ComboboxSelected>>", self._on_display_channel_changed)
 
         controls = ttk.LabelFrame(side, text="Transform")
         controls.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -713,6 +726,67 @@ class AtlasFittingApp(tk.Tk):
     def _normalize_filename_key(self, name: str) -> str:
         return Path(name).stem.strip().lower().replace(" ", "_")
 
+    def _channel_neutral_filename_key(self, name: str) -> str:
+        """Return a slice key that ignores display channel suffixes such as CH2/CH3."""
+
+        normalized = self._normalize_filename_key(name)
+        tokens = re.split(r"[_\-]+", normalized)
+        filtered = [token for token in tokens if not re.fullmatch(r"ch\d+", token, flags=re.IGNORECASE)]
+        return "_".join(token for token in filtered if token)
+
+    def _selected_display_channel(self) -> str:
+        value = str(self.display_channel_var.get() or "").strip().upper()
+        if not value or value.startswith("AUTO"):
+            return ""
+        return value if re.fullmatch(r"CH\d+", value) else ""
+
+    def _display_image_path_for(self, json_image_path: Path) -> Path:
+        """Return the image to show on screen without changing the JSON slice filename."""
+
+        channel = self._selected_display_channel()
+        if not channel:
+            return json_image_path
+        swapped_name = re.sub(r"(?i)CH\d+", channel, json_image_path.name, count=1)
+        if swapped_name == json_image_path.name:
+            return json_image_path
+        candidate = json_image_path.with_name(swapped_name)
+        if candidate.exists():
+            return candidate
+        lowered = swapped_name.lower()
+        try:
+            for sibling in json_image_path.parent.iterdir():
+                if sibling.is_file() and sibling.name.lower() == lowered:
+                    return sibling
+        except OSError:
+            pass
+        return json_image_path
+
+    def _on_display_channel_changed(self, _event: tk.Event | None = None) -> None:
+        if not (0 <= self.current_index < len(self.image_paths)):
+            return
+        state = self._read_state_from_controls()
+        if state is not None:
+            self.slice_states[self.image_paths[self.current_index].name] = state
+        self._current_base_signature = None
+        self._load_current_slice()
+
+    def _omit_strokes_for_image(
+        self,
+        omit_by_name: dict[str, list[dict[str, object]]],
+        image_name: str,
+    ) -> list[dict[str, object]]:
+        """Find omit strokes by exact filename first, then by channel-neutral slice key."""
+
+        lookup_keys = [
+            image_name,
+            self._normalize_filename_key(image_name),
+            self._channel_neutral_filename_key(image_name),
+        ]
+        for key in lookup_keys:
+            if key in omit_by_name:
+                return [self._clone_omit_stroke(stroke) for stroke in omit_by_name[key]]
+        return []
+
     def _sort_paths_anterior_to_posterior(
         self,
         paths: list[Path],
@@ -782,7 +856,16 @@ class AtlasFittingApp(tk.Tk):
             return
         layout_guard = self._capture_window_layout_guard()
         path = self.image_paths[self.current_index]
-        image = ensure_rgb(load_image_array(path))
+        display_path = self._display_image_path_for(path)
+        image = ensure_rgb(load_image_array(display_path))
+        expected_shape = self.image_sizes[path.name]
+        if image.shape[:2] != expected_shape:
+            self._append_log(
+                f"Display channel image size mismatch for {display_path.name}; using JSON image {path.name}"
+            )
+            display_path = path
+            image = ensure_rgb(load_image_array(path))
+        self.current_display_image_path = display_path
         self.current_preview_rgb = image
         self.current_preview_shape = None
         self.current_region_map = None
@@ -800,7 +883,10 @@ class AtlasFittingApp(tk.Tk):
         self._marker_input_ready = False
         self.hover_region_var.set("")
         self._prime_display_geometry_for_current_slice(center_view=True)
-        self.slice_label_var.set(f"{path.name}  ({self.current_index + 1}/{len(self.image_paths)})")
+        label = f"{path.name}  ({self.current_index + 1}/{len(self.image_paths)})"
+        if display_path.name != path.name:
+            label = f"{label}  | display: {display_path.name}"
+        self.slice_label_var.set(label)
         self._push_state_to_controls(self.slice_states[path.name])
         self._update_preview_note()
         self.status_var.set("Pan: left-drag atlas, wheel zoom, hold Space to fade atlas | Marker: right-click add, left-drag move | Omit: Brush left-drag / Polygon left-click add, right-click close")
@@ -1369,7 +1455,10 @@ class AtlasFittingApp(tk.Tk):
         name = self.image_paths[self.current_index].name
         state = self.slice_states[name]
         self._selected_omit_stroke_index = None
-        self._set_state_for_current_slice(self._copy_state_with_omit_strokes(state, []), schedule=True)
+        updated_state = self._copy_state_with_omit_strokes(state, [])
+        self._set_state_for_current_slice(updated_state, schedule=False)
+        if not self._refresh_omit_overlay_only(updated_state):
+            self._schedule_render(interactive=False, delay_ms=1)
         self.status_var.set("Cleared omit mask")
         self._append_log(f"Cleared omit mask on {name}")
 
@@ -1396,7 +1485,10 @@ class AtlasFittingApp(tk.Tk):
             return
         omit_strokes = [self._clone_omit_stroke(stroke) for stroke in state.omit_strokes[:-1]]
         self._selected_omit_stroke_index = None
-        self._set_state_for_current_slice(self._copy_state_with_omit_strokes(state, omit_strokes), schedule=True)
+        updated_state = self._copy_state_with_omit_strokes(state, omit_strokes)
+        self._set_state_for_current_slice(updated_state, schedule=False)
+        if not self._refresh_omit_overlay_only(updated_state):
+            self._schedule_render(interactive=False, delay_ms=1)
         self.status_var.set("Undid last omit stroke")
         self._append_log(f"Undid last omit stroke on {name}")
 
@@ -1541,9 +1633,51 @@ class AtlasFittingApp(tk.Tk):
         self._live_omit_points = []
         self._live_omit_mode = "brush"
         self._selected_omit_stroke_index = len(omit_strokes) - 1
-        self._set_state_for_current_slice(self._copy_state_with_omit_strokes(state, omit_strokes), schedule=False)
-        self.status_var.set("Updating omit mask")
-        self._schedule_refine_render()
+        updated_state = self._copy_state_with_omit_strokes(state, omit_strokes)
+        self._set_state_for_current_slice(updated_state, schedule=False)
+        if self._refresh_omit_overlay_only(updated_state):
+            self.status_var.set("Updated omit mask")
+        else:
+            self.status_var.set("Updating omit mask")
+            self._schedule_render(interactive=False, delay_ms=1)
+
+    def _refresh_omit_overlay_only(self, state: SliceFitState) -> bool:
+        """Refresh only the red omit overlay layer without rebuilding the atlas map."""
+
+        if self.current_preview_rgb is None:
+            return False
+        composite_shape = self.current_composite_shape or self.current_preview_shape
+        if composite_shape is None:
+            return False
+        image_size = (int(composite_shape[1]), int(composite_shape[0]))
+        omit_overlay = self._compose_omit_overlay(state.omit_strokes, image_size)
+        if (
+            self.current_omit_photo is None
+            or self.current_omit_photo.width() != omit_overlay.size[0]
+            or self.current_omit_photo.height() != omit_overlay.size[1]
+        ):
+            self.current_omit_photo = ImageTk.PhotoImage(omit_overlay)
+        else:
+            self.current_omit_photo.paste(omit_overlay)
+        if self._canvas_omit_item is None:
+            self._canvas_omit_item = self.canvas.create_image(
+                self.current_display_offset[0],
+                self.current_display_offset[1],
+                anchor="nw",
+                image=self.current_omit_photo,
+            )
+        else:
+            self.canvas.itemconfigure(self._canvas_omit_item, image=self.current_omit_photo)
+            self.canvas.coords(
+                self._canvas_omit_item,
+                self.current_display_offset[0],
+                self.current_display_offset[1],
+            )
+        self._draw_marker_canvas_items(state)
+        if self._last_canvas_xy is not None:
+            self._update_omit_cursor_preview(self._last_canvas_xy[0], self._last_canvas_xy[1])
+        self._update_preview_note()
+        return True
 
     def _on_canvas_mousewheel(self, event: tk.Event) -> None:
         if not (0 <= self.current_index < len(self.image_paths)):
@@ -2229,8 +2363,11 @@ class AtlasFittingApp(tk.Tk):
             return
         path = self.image_paths[self.current_index]
         height, width = self.image_sizes[path.name]
+        display_name = self.current_display_image_path.name if self.current_display_image_path else path.name
+        display_line = f"Display image: {display_name}\n" if display_name != path.name else ""
         note = (
             f"Image {width}x{height} | Zoom {self.view_zoom_factor:.2f}x\n"
+            f"{display_line}"
             "Pan: left-drag atlas, mouse wheel zoom\n"
             "Space hold: fade atlas for alignment check | Marker: right-click add, left-drag move, Delete/BackSpace remove\n"
             "Omit: Brush left-drag paint | Polygon left-click add, right-click close | Undo omit removes the last point"
@@ -2509,23 +2646,6 @@ class AtlasFittingApp(tk.Tk):
                 atlas_sampling_radius_vox=2,
                 atlas_sampling_batch_size=4096,
             )
-            baseline_region_map = None
-            if state.markers and not interactive:
-                baseline_slice = replace(preview_slice, markers=[])
-                baseline_region_map, _, _ = build_registered_maps(
-                    self.atlas,
-                    baseline_slice,
-                    atlas_preview_shape,
-                    midline_threshold_um=75.0,
-                    registration_offset_px=(float(atlas_preview_pad_x), float(atlas_preview_pad_y)),
-                    registration_source_shape=preview_render_shape,
-                    chunk_rows=128,
-                    smooth_regions=False,
-                    simplify_contours=False,
-                    atlas_sampling_mode="nearest",
-                    atlas_sampling_radius_vox=2,
-                    atlas_sampling_batch_size=4096,
-                )
             if atlas_preview_shape != composite_shape:
                 region_map = np.asarray(
                     Image.fromarray(region_map.astype(np.int32), mode="I").resize(
@@ -2534,14 +2654,6 @@ class AtlasFittingApp(tk.Tk):
                     ),
                     dtype=np.int32,
                 )
-                if baseline_region_map is not None:
-                    baseline_region_map = np.asarray(
-                        Image.fromarray(baseline_region_map.astype(np.int32), mode="I").resize(
-                            (composite_shape[1], composite_shape[0]),
-                            resample=Image.Resampling.NEAREST,
-                        ),
-                        dtype=np.int32,
-                    )
             display_image = self.current_preview_rgb
             if render_shape != self.current_preview_rgb.shape[:2]:
                 display_image = np.asarray(
@@ -2552,7 +2664,7 @@ class AtlasFittingApp(tk.Tk):
                 )
             self.current_region_map = region_map
             self._ensure_canvas_base_layer(
-                path.name,
+                f"{path.name}|display={self.current_display_image_path.name if self.current_display_image_path else path.name}",
                 display_image,
                 render_shape,
                 composite_shape,
@@ -2564,15 +2676,6 @@ class AtlasFittingApp(tk.Tk):
                 self._effective_atlas_opacity(),
                 (composite_shape[1], composite_shape[0]),
             )
-            if baseline_region_map is not None:
-                baseline_overlay = self._compose_boundary_overlay(
-                    baseline_region_map,
-                    opacity=0.40,
-                    image_size=(composite_shape[1], composite_shape[0]),
-                    color=(255, 170, 60),
-                    max_filter_size=1,
-                )
-                atlas_overlay = Image.alpha_composite(baseline_overlay, atlas_overlay)
             self._current_atlas_alpha = np.asarray(atlas_overlay.getchannel("A"), dtype=np.uint8)
             self._cache_boundary_preview_geometry(self._current_atlas_alpha)
             omit_overlay = self._compose_omit_overlay(
@@ -2951,7 +3054,7 @@ class AtlasFittingApp(tk.Tk):
             matched_sizes[image_path.name] = self.image_sizes[image_path.name]
             matched_states[image_path.name] = self._state_from_registration_slice(
                 registration_slice,
-                omit_strokes=omit_by_name.get(image_path.name, []),
+                omit_strokes=self._omit_strokes_for_image(omit_by_name, image_path.name),
             )
             loaded += 1
         if loaded == 0:
@@ -3028,11 +3131,15 @@ class AtlasFittingApp(tk.Tk):
                 continue
             image_height, image_width = self.image_sizes[image_path.name]
             mask = self._render_omit_mask((image_width, image_height), state.omit_strokes, 1.0)
-            mask_name = f"{image_path.stem}_omit_mask.png"
+            slice_key = self._channel_neutral_filename_key(image_path.name)
+            mask_stem = slice_key or self._normalize_filename_key(image_path.name)
+            mask_name = f"{mask_stem}_omit_mask.png"
             mask_path = masks_dir / mask_name
             mask.save(mask_path)
             keep_files.add(mask_name)
             sidecar_slices[image_path.name] = {
+                "slice_key": slice_key,
+                "image_filename": image_path.name,
                 "omit_strokes": [self._clone_omit_stroke(stroke) for stroke in state.omit_strokes],
                 "mask_file": mask_name,
             }
@@ -3070,7 +3177,26 @@ class AtlasFittingApp(tk.Tk):
             omit_strokes = values.get("omit_strokes", [])
             if not isinstance(omit_strokes, list):
                 continue
-            loaded[str(filename)] = [self._clone_omit_stroke(stroke) for stroke in omit_strokes if isinstance(stroke, dict)]
+            cloned_strokes = [self._clone_omit_stroke(stroke) for stroke in omit_strokes if isinstance(stroke, dict)]
+            if not cloned_strokes:
+                continue
+            raw_filename = str(filename)
+            keys = {
+                raw_filename,
+                self._normalize_filename_key(raw_filename),
+                self._channel_neutral_filename_key(raw_filename),
+            }
+            sidecar_slice_key = values.get("slice_key", "")
+            if isinstance(sidecar_slice_key, str) and sidecar_slice_key.strip():
+                keys.add(sidecar_slice_key.strip().lower().replace(" ", "_"))
+            image_filename = values.get("image_filename", "")
+            if isinstance(image_filename, str) and image_filename.strip():
+                keys.add(image_filename)
+                keys.add(self._normalize_filename_key(image_filename))
+                keys.add(self._channel_neutral_filename_key(image_filename))
+            for key in keys:
+                if key and key not in loaded:
+                    loaded[key] = [self._clone_omit_stroke(stroke) for stroke in cloned_strokes]
         return loaded
 
     def _save_quicknii_json(self, silent: bool = False) -> bool:

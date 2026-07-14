@@ -137,6 +137,17 @@ def run_deepslice_job(
     if progress_callback:
         progress_callback("Converting TIFF to JPEG", 0.20)
     converted = convert_tiffs_to_jpgs(tiff_paths, jpg_dir, logger=logger)
+    auxiliary_converted = convert_nonselected_channel_tiffs_to_jpgs(
+        input_dir=input_dir,
+        selected_channel=channel,
+        jpg_dir=jpg_dir,
+        logger=logger,
+    )
+    if auxiliary_converted:
+        logger.info(
+            "Prepared %d non-fitting channel JPEG(s) for AtlasFitter display.",
+            len(auxiliary_converted),
+        )
 
     output_name = Path(str(output_stem_name).strip() or "jpgDS_results").stem
     output_stem = jpg_dir / output_name
@@ -260,6 +271,43 @@ def discover_channel_tiffs(input_dir: Path, channel: str) -> list[Path]:
             continue
         matched.append(path)
     return matched
+
+
+def discover_nonselected_channel_tiffs(input_dir: Path, selected_channel: str) -> list[Path]:
+    """Return TIFF files for channels other than the fitting channel."""
+
+    selected = selected_channel.strip().upper()
+    matched: list[Path] = []
+    for path in sorted(input_dir.iterdir()):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".tif", ".tiff"}:
+            continue
+        image_channel = extract_image_channel(path.name).upper()
+        if not image_channel or image_channel == selected:
+            continue
+        matched.append(path)
+    return matched
+
+
+def convert_nonselected_channel_tiffs_to_jpgs(
+    input_dir: Path,
+    selected_channel: str,
+    jpg_dir: Path,
+    *,
+    logger: logging.Logger | None = None,
+) -> list[ConvertedJpg]:
+    """Write contrast-enhanced JPEGs for non-fitting channels without using them for DeepSlice."""
+
+    other_tiffs = discover_nonselected_channel_tiffs(input_dir, selected_channel)
+    if not other_tiffs:
+        return []
+    logger = logger or LOG
+    logger.info(
+        "Preparing display JPEGs for %d non-fitting channel TIFF(s).",
+        len(other_tiffs),
+    )
+    return convert_tiffs_to_jpgs(other_tiffs, jpg_dir, logger=logger)
 
 
 def normalize_ap_hint_mode(value: str | None) -> str:

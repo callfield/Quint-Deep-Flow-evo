@@ -16,9 +16,13 @@ The repository includes one small demo slice under `demo/one_slice`.
 
 `QDFevo_1_Align` estimates the AP position and initial atlas alignment for brain section images with DeepSlice. Adding an AP hint CSV lets the workflow restrict AP estimation to a user-defined range, which is useful when the expected section level is already known. For robust regional position estimation, DAPI-stained section images are recommended.
 
+When a fitting channel is selected, only that channel is passed to DeepSlice. Other detected TIFF channels are also exported as contrast-enhanced JPEGs into the same `jpg` folder so that `QDFevo_2_AtlasFitter` can switch display channels without rerunning alignment.
+
 ### QDFevo_2_AtlasFitter
 
 `QDFevo_2_AtlasFitter` lets users intuitively manually refine the brain slice position estimated by `QDFevo_1_Align`. It supports AP position, image rotation, atlas size, and center-position transforms, marker-based intuitive non-linear fitting, and omit-region editing for damaged or contaminated areas that should be partially excluded from later analysis.
+
+Omit editing is kept lightweight during manual work: committing, undoing, or clearing an omit stroke refreshes only the red omit overlay layer instead of rebuilding the atlas map immediately.
 
 ### QDFevo_3_Quantitate
 
