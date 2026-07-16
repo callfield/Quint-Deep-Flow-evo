@@ -9,7 +9,8 @@ import numpy as np
 
 from data_models.models import RegistrationSlice
 
-PADDING_MARKER_RATIO = 0.35
+PADDING_MARKER_RATIO = 0.10
+MIN_TRIANGLE_AREA2 = 1.0e-6
 
 
 def _marker_xy(x: float, y: float) -> list[float]:
@@ -39,6 +40,9 @@ class VisualignTriangle:
     source_b_delta: np.ndarray
     source_c_delta: np.ndarray
     target_a: np.ndarray
+    source_area2: float
+    target_area2: float
+    orientation_preserving: bool
 
     def __init__(self, first: int, second: int, third: int, trimarkers: list[list[float]]) -> None:
         indices = sorted((int(first), int(second), int(third)))
@@ -64,6 +68,13 @@ class VisualignTriangle:
         self.source_b_delta = self.source_points[1] - self.source_points[0]
         self.source_c_delta = self.source_points[2] - self.source_points[0]
         self.target_a = self.target_points[0].copy()
+        self.source_area2 = self._signed_area2(self.source_points)
+        self.target_area2 = self._signed_area2(self.target_points)
+        self.orientation_preserving = (
+            abs(self.source_area2) > MIN_TRIANGLE_AREA2
+            and abs(self.target_area2) > MIN_TRIANGLE_AREA2
+            and (self.source_area2 * self.target_area2) > 0.0
+        )
         self.minx = float(np.min(self.target_points[:, 0]))
         self.miny = float(np.min(self.target_points[:, 1]))
         self.maxx = float(np.max(self.target_points[:, 0]))
@@ -100,6 +111,13 @@ class VisualignTriangle:
         dx = float(x1 - x2)
         dy = float(y1 - y2)
         return (dx * dx) + (dy * dy)
+
+    @staticmethod
+    def _signed_area2(points: np.ndarray) -> float:
+        return float(
+            ((points[1, 0] - points[0, 0]) * (points[2, 1] - points[0, 1]))
+            - ((points[1, 1] - points[0, 1]) * (points[2, 0] - points[0, 0]))
+        )
 
     def intri(self, x: float, y: float) -> np.ndarray | None:
         if x < self.minx or x > self.maxx or y < self.miny or y > self.maxy or self.decomp is None:
@@ -225,17 +243,23 @@ def _triangulate_markers(markers: list[list[float]], width: float, height: float
         for triangle in bad_triangles:
             for edge in ((triangle.a, triangle.b), (triangle.a, triangle.c), (triangle.b, triangle.c)):
                 edge_counts[edge] = edge_counts.get(edge, 0) - 1
-        triangles = [triangle for triangle in triangles if triangle not in bad_triangles]
 
-        trimarkers.append([float(value) for value in marker[:4]])
-        new_index = len(trimarkers) - 1
+        trial_markers = [*trimarkers, [float(value) for value in marker[:4]]]
+        new_index = len(trial_markers) - 1
         new_triangles: list[VisualignTriangle] = []
+        rejected_folded_triangle = False
         for edge, count in edge_counts.items():
             if count == -1:
-                candidate = VisualignTriangle(edge[0], edge[1], new_index, trimarkers)
-                if candidate.decomp is not None:
+                candidate = VisualignTriangle(edge[0], edge[1], new_index, trial_markers)
+                if candidate.decomp is not None and candidate.orientation_preserving:
                     new_triangles.append(candidate)
+                else:
+                    rejected_folded_triangle = True
+        if rejected_folded_triangle or not new_triangles:
+            continue
+        triangles = [triangle for triangle in triangles if triangle not in bad_triangles]
         triangles.extend(new_triangles)
+        trimarkers = trial_markers
     return trimarkers, triangles
 
 

@@ -7,6 +7,7 @@ import gc
 import json
 import logging
 import os
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -47,16 +48,61 @@ from io_utils.nutil_reference import (
 from multichannel.matcher import apply_multichannel_matching, expand_overlap_set_spec
 from overlays.render import (
     build_registered_maps,
+    qdf2d_base_registration_slice,
+    qdf2d_transform_payload,
     save_multichannel_overlay_images,
 )
 from quantification.assignment import assign_object_region
 from quantification.detector import detect_cells
 from quantification.evo_omit import apply_qdf1_evo_omit_to_results
 from quantification.hemisphere import hemisphere_from_ml_um
-from registration.nonlinear import build_marker_inverse_warp, image_points_to_registration_source
+from registration.nonlinear import build_marker_inverse_warp, build_piecewise_affine_mapper, image_points_to_registration_source
 from registration.parser import match_registration_slice, parse_registration_file
 
 LOG = logging.getLogger(__name__)
+
+
+class _CsvRowSpool:
+    """Append row dictionaries to a temporary CSV without retaining all rows in memory."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.columns: list[str] = []
+        self.row_count = 0
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append_rows(self, rows: list[dict[str, object]]) -> None:
+        if not rows:
+            return
+        frame = pd.DataFrame(rows)
+        if self.row_count == 0:
+            self.columns = list(frame.columns)
+            frame.to_csv(self.path, index=False)
+        else:
+            for column in self.columns:
+                if column not in frame.columns:
+                    frame[column] = pd.NA
+            frame = frame.reindex(columns=self.columns)
+            frame.to_csv(self.path, mode="a", header=False, index=False)
+        self.row_count += int(len(frame))
+        del frame
+
+    def materialize(self, output_path: Path) -> pd.DataFrame:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            self.path.replace(output_path)
+        else:
+            pd.DataFrame(columns=self.columns).to_csv(output_path, index=False)
+        return pd.DataFrame(columns=self.columns)
+
+
+def _drop_row_keys(rows: list[dict[str, object]], keys: set[str]) -> list[dict[str, object]]:
+    """Return rows with transient/internal keys removed before CSV spooling."""
+
+    if not rows:
+        return rows
+    return [{key: value for key, value in row.items() if key not in keys} for row in rows]
 
 
 def _display_code_map_from_region_maps(region_map: np.ndarray, hemisphere_map: np.ndarray) -> np.ndarray:
@@ -106,22 +152,50 @@ class QuantificationPipeline:
         if self.config.output.save_resolved_config:
             save_app_config(self.config, output_dir / "resolved_config.yaml")
 
+        spool_dir = output_dir / "_qdf_tmp_rows"
+        if spool_dir.exists():
+            shutil.rmtree(spool_dir, ignore_errors=True)
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        cell_spool = _CsvRowSpool(spool_dir / "cell_level.csv")
+        region_spool = _CsvRowSpool(spool_dir / "region_summary.csv")
+        section_spool = _CsvRowSpool(spool_dir / "section_summary.csv")
+
         processing_rows: list[dict[str, object]] = []
-        section_rows: list[dict[str, object]] = []
-        region_rows_all: list[dict[str, object]] = []
-        cell_rows: list[dict[str, object]] = []
         comparison_inputs: list[SectionChannelResult] = []
         animal_multichannel_channel_maps: dict[str, pd.DataFrame] = {}
 
+        def consume_payload(payload: dict[str, object]) -> None:
+            processing_rows.extend(payload["processing_rows"])  # type: ignore[arg-type]
+            channel_map_frame = payload.get("channel_map_frame")
+            animal_id = str(payload.get("animal_id", ""))
+            if isinstance(channel_map_frame, pd.DataFrame) and animal_id and animal_id not in animal_multichannel_channel_maps:
+                animal_multichannel_channel_maps[animal_id] = channel_map_frame.copy()
+            cell_spool.append_rows(payload.get("cell_rows", []))  # type: ignore[arg-type]
+            region_spool.append_rows(
+                _drop_row_keys(
+                    payload.get("region_rows", []),  # type: ignore[arg-type]
+                    {"channel", "summary_source"},
+                )
+            )
+            section_spool.append_rows(
+                _drop_row_keys(
+                    payload.get("section_rows", []),  # type: ignore[arg-type]
+                    {"channel", "image_file", "json_file", "mask_source", "registration_qc_metrics", "summary_source"},
+                )
+            )
+            if self.config.comparison.enabled:
+                comparison_inputs.extend(payload.get("comparison_results", []))  # type: ignore[arg-type]
+            payload.clear()
+            gc.collect()
+
         total_groups = max(len(groups), 1)
-        group_payloads: list[dict[str, object]] = []
         parallel_workers = self._resolve_parallel_workers(len(groups))
         if parallel_workers <= 1:
             for index, group in enumerate(groups, start=1):
                 if progress_callback:
                     progress_callback(f"Processing {group.animal_id} {group.section_id}", (index - 1) / total_groups)
                 payload = self._process_group(group, atlas, output_dir)
-                group_payloads.append(payload)
+                consume_payload(payload)
                 if progress_callback:
                     progress_callback(f"Processed {group.animal_id} {group.section_id}", index / total_groups)
         else:
@@ -135,26 +209,13 @@ class QuantificationPipeline:
                     index, group = future_map[future]
                     payload = future.result()
                     payload["group_index"] = index
-                    group_payloads.append(payload)
+                    consume_payload(payload)
                     completed += 1
                     if progress_callback:
                         progress_callback(
                             f"Processed {group.animal_id} {group.section_id} [{completed}/{len(groups)}]",
                             completed / total_groups,
                         )
-        group_payloads.sort(key=lambda payload: int(payload.get("group_index", 0)))
-
-        for payload in group_payloads:
-            processing_rows.extend(payload["processing_rows"])  # type: ignore[arg-type]
-            channel_map_frame = payload.get("channel_map_frame")
-            animal_id = str(payload.get("animal_id", ""))
-            if isinstance(channel_map_frame, pd.DataFrame) and animal_id and animal_id not in animal_multichannel_channel_maps:
-                animal_multichannel_channel_maps[animal_id] = channel_map_frame.copy()
-            cell_rows.extend(payload.get("cell_rows", []))  # type: ignore[arg-type]
-            region_rows_all.extend(payload.get("region_rows", []))  # type: ignore[arg-type]
-            section_rows.extend(payload.get("section_rows", []))  # type: ignore[arg-type]
-            if self.config.comparison.enabled:
-                comparison_inputs.extend(payload.get("comparison_results", []))  # type: ignore[arg-type]
 
         if progress_callback and self.config.comparison.enabled:
             progress_callback("Comparing with existing Nutil outputs", 0.96)
@@ -164,22 +225,11 @@ class QuantificationPipeline:
             if self.config.comparison.enabled
             else pd.DataFrame()
         )
-        cell_df = pd.DataFrame(cell_rows)
-        region_df = pd.DataFrame(region_rows_all)
-        section_df = pd.DataFrame(section_rows)
-        region_df = region_df.drop(columns=["channel", "summary_source"], errors="ignore")
-        section_df = section_df.drop(
-            columns=["channel", "image_file", "json_file", "mask_source", "registration_qc_metrics", "summary_source"],
-            errors="ignore",
-        )
         processing_df = pd.DataFrame(processing_rows)
 
         tables = {
             "discovery_table.csv": discovery_df,
             "atlas_display_codebook.csv": display_codebook_df,
-            "cell_level.csv": cell_df,
-            "region_summary.csv": region_df,
-            "section_summary.csv": section_df,
             "processing_log.csv": processing_df,
         }
         if not mask_normalization_df.empty:
@@ -187,8 +237,13 @@ class QuantificationPipeline:
         if self.config.comparison.enabled:
             tables["comparison_report.csv"] = comparison_df
 
-        self._cleanup_obsolete_outputs(output_dir, set(tables), comparison_enabled=self.config.comparison.enabled)
+        spooled_table_names = {"cell_level.csv", "region_summary.csv", "section_summary.csv"}
+        self._cleanup_obsolete_outputs(output_dir, set(tables) | spooled_table_names, comparison_enabled=self.config.comparison.enabled)
         write_tables(output_dir, tables)
+        cell_df = cell_spool.materialize(output_dir / "cell_level.csv")
+        region_df = region_spool.materialize(output_dir / "region_summary.csv")
+        section_df = section_spool.materialize(output_dir / "section_summary.csv")
+        shutil.rmtree(spool_dir, ignore_errors=True)
         animal_channel_map_paths = self._write_animal_channel_map_workbooks(
             output_dir,
             animal_multichannel_channel_maps,
@@ -441,6 +496,7 @@ class QuantificationPipeline:
             watershed_selective_elongation_threshold=self._watershed_selective_elongation_threshold_for_bundle(bundle),
             mask_source=bundle.mask_source,
         )
+        del mask, intensity
 
         output_shape = tuple(int(value) for value in image.shape[:2])
         if output_shape in registered_maps_by_shape:
@@ -463,22 +519,31 @@ class QuantificationPipeline:
         qc_metrics["atlas_map_cache_source"] = atlas_map_source
         qc_metrics["atlas_map_elapsed_seconds"] = round(float(atlas_map_elapsed), 4)
         qc_metrics["atlas_map_cache_path"] = str(cache_entry.cache_path) if cache_entry.cache_path else ""
+        qdf2d_payload = qdf2d_transform_payload(reg_slice)
+        coordinate_slice = reg_slice
         marker_warp = build_marker_inverse_warp(reg_slice, image.shape[:2])
+        if qdf2d_payload is not None:
+            coordinate_slice = qdf2d_base_registration_slice(reg_slice, qdf2d_payload)
+            corner_rows = qdf2d_payload.get("corner_markers")
+            marker_rows = corner_rows if isinstance(corner_rows, list) else []
+            marker_rows = [list(row) for row in marker_rows if isinstance(row, list) and len(row) >= 4]
+            marker_rows.extend([list(marker) for marker in reg_slice.markers if len(marker) >= 4])
+            marker_warp = build_piecewise_affine_mapper(reg_slice.width, reg_slice.height, marker_rows)
 
         if detected:
             centroids_xy = np.asarray([[obj.centroid_x_px, obj.centroid_y_px] for obj in detected], dtype=np.float64)
             registration_xy = image_points_to_registration_source(
                 centroids_xy,
                 image.shape[:2],
-                reg_slice,
+                coordinate_slice,
                 mapper=marker_warp,
             )
-            registration_height = float(max(reg_slice.height, 1))
-            registration_width = float(max(reg_slice.width, 1))
+            registration_height = float(max(coordinate_slice.height, 1))
+            registration_width = float(max(coordinate_slice.width, 1))
             centroid_quicknii = (
-                reg_slice.origin.astype(np.float64, copy=False)[None, :]
-                + reg_slice.u.astype(np.float64, copy=False)[None, :] * (registration_xy[:, 0:1] / registration_width)
-                + reg_slice.v.astype(np.float64, copy=False)[None, :] * (registration_xy[:, 1:2] / registration_height)
+                coordinate_slice.origin.astype(np.float64, copy=False)[None, :]
+                + coordinate_slice.u.astype(np.float64, copy=False)[None, :] * (registration_xy[:, 0:1] / registration_width)
+                + coordinate_slice.v.astype(np.float64, copy=False)[None, :] * (registration_xy[:, 1:2] / registration_height)
             )
             allen_um = atlas.quicknii_to_allen_um(centroid_quicknii)
             ap_ml_dv = atlas.allen_um_to_bregma_array(allen_um, unit=self.config.processing.coordinate_unit)
@@ -497,7 +562,9 @@ class QuantificationPipeline:
                     atlas,
                     border_policy=self.config.processing.border_assignment_policy,
                 )
-                if marker_warp is not None:
+                if qdf2d_payload is not None:
+                    obj.assignment_method = f"qdf2d_layer:{region_method}"
+                elif marker_warp is not None:
                     obj.assignment_method = f"visualign_piecewise_affine:{region_method}"
                 else:
                     obj.assignment_method = region_method

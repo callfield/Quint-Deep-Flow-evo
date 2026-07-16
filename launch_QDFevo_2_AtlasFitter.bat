@@ -7,6 +7,9 @@ rem then %USERPROFILE%\Documents\QDF_portable, then the active Python on PATH.
 set "REPO_ROOT=%~dp0"
 if not defined QDF_RUNTIME_ROOT set "QDF_RUNTIME_ROOT=%USERPROFILE%\Documents\QDF_portable"
 set "QUINT_PORTABLE_BUNDLE_ROOT=%REPO_ROOT%"
+set "PYTHONNOUSERSITE=1"
+set "QDF_QDF2D_NUMBA_WARP=1"
+if not defined NUMBA_NUM_THREADS set "NUMBA_NUM_THREADS=8"
 
 if exist "%REPO_ROOT%rt\py\python.exe" (
   set "QDF_APP_PYTHON=%REPO_ROOT%rt\py\python.exe"

@@ -14,7 +14,7 @@ import numpy as np
 from atlas.repository import AtlasRepository
 from data_models.models import RegistrationSlice
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 @dataclass(slots=True)

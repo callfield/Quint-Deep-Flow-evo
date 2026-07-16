@@ -36,6 +36,35 @@ OMIT_LAYER_CONTENT = "omit_region_mask"
 OMIT_PLANE_VALUE = 65535
 
 
+def _overlay_stack_shape(path: Path) -> tuple[int, int, int]:
+    """Return overlay stack shape as (planes, height, width) without reading pixel data."""
+
+    with tifffile.TiffFile(path) as tif:
+        shape = tuple(int(value) for value in tif.series[0].shape)
+    if len(shape) == 2:
+        return (1, int(shape[0]), int(shape[1]))
+    if len(shape) == 3:
+        return (int(shape[0]), int(shape[1]), int(shape[2]))
+    raise ValueError(f"Expected 2D/3D overlay stack in {path}, got shape {shape}")
+
+
+def _read_overlay_plane(path: Path, plane_index: int) -> np.ndarray:
+    """Read one overlay plane, falling back to full-stack indexing for nonstandard TIFFs."""
+
+    try:
+        plane = tifffile.imread(path, key=int(plane_index))
+        if plane.ndim == 2:
+            return np.asarray(plane)
+    except Exception:
+        pass
+    stack = tifffile.imread(path)
+    if stack.ndim == 2:
+        if int(plane_index) != 0:
+            raise IndexError(f"Overlay plane {plane_index} out of range for {path}")
+        return np.asarray(stack)
+    return np.asarray(stack[int(plane_index)])
+
+
 def find_qdf1_evo_omit_state_path(registration_json_path: Path) -> Path | None:
     """Return the omit-state JSON next to a QDFevo_2_AtlasFitter registration JSON when present."""
 
@@ -134,8 +163,7 @@ def _omit_masks_from_qdf1_evo_state(
         entries = section_to_entries.get(slice_info.section_id, [])
         if not entries:
             continue
-        stack = tifffile.imread(slice_info.overlay_path)
-        height, width = stack.shape[1], stack.shape[2]
+        _, height, width = _overlay_stack_shape(slice_info.overlay_path)
         combined_mask = np.zeros((height, width), dtype=bool)
         for image_name, payload in entries:
             strokes = payload.get("omit_strokes", [])
@@ -312,6 +340,8 @@ def _write_omit_plane_to_overlay(
 
     for slice_info in dataset.slices:
         stack = tifffile.imread(slice_info.overlay_path)
+        if stack.ndim == 2:
+            stack = stack[None, ...]
         if stack.ndim != 3:
             raise ValueError(f"Expected 3D overlay stack in {slice_info.overlay_path}, got shape {stack.shape}")
         omit_mask = np.asarray(
@@ -518,7 +548,6 @@ def _apply_omit_mask_to_cell_level(
         if omit_mask is None or not np.any(omit_mask):
             continue
 
-        stack = tifffile.imread(slice_info.overlay_path)
         section_frame = working.loc[pd.Index(index_labels)]
 
         for image_channel, channel_frame in section_frame.groupby("image_channel", sort=False):
@@ -530,8 +559,15 @@ def _apply_omit_mask_to_cell_level(
                 omit_flags[valid_xy] = omit_mask[y[valid_xy], x[valid_xy]]
 
             plane_index = roi_plane_indices.get(str(image_channel).upper())
-            if plane_index is not None and 0 <= int(plane_index) < stack.shape[0]:
-                roi_plane = np.asarray(stack[int(plane_index)] > 0, dtype=np.uint8)
+            if plane_index is not None:
+                try:
+                    roi_plane = np.asarray(_read_overlay_plane(slice_info.overlay_path, int(plane_index)) > 0, dtype=np.uint8)
+                except Exception:
+                    LOG.exception("Failed reading ROI plane %s from %s", plane_index, slice_info.overlay_path)
+                    roi_plane = None
+            else:
+                roi_plane = None
+            if roi_plane is not None:
                 labels, _ = ndimage.label(roi_plane, structure=np.ones((3, 3), dtype=np.uint8))
                 component_labels = _sample_component_labels(labels, x, y)
                 touched_components = np.unique(labels[omit_mask])

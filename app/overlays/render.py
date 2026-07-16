@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import re
 
@@ -12,15 +13,16 @@ from scipy import ndimage
 import tifffile
 
 try:
-    from numba import njit
+    from numba import njit, prange
 except Exception:  # pragma: no cover - optional acceleration
     njit = None
+    prange = range
 
 from atlas.display_codes import midline_offset, stable_region_display_code
 from atlas.repository import AtlasRepository
 from data_models.models import DetectedObject, RegistrationSlice
 from io_utils.image_io import ensure_rgb, grayscale_intensity
-from registration.nonlinear import build_marker_inverse_warp, image_points_to_registration_source
+from registration.nonlinear import build_marker_inverse_warp, build_piecewise_affine_mapper, image_points_to_registration_source
 
 CELL_OUTLINE_RGB = (235, 235, 235)
 REGION_OUTLINE_RGB = (230, 220, 120)
@@ -31,6 +33,7 @@ FALLBACK_CHANNEL_COLORS = (
     (255, 195, 90),
 )
 CHANNEL_PATTERN = re.compile(r"CH(\d+)", re.IGNORECASE)
+QDF2D_TRANSFORM_KEY = "qdf2d_transform"
 
 
 if njit is not None:
@@ -71,6 +74,283 @@ else:
     _best_replacement_values_numba = None
 
 
+if njit is not None:
+
+    @njit(cache=True)
+    def _round_half_to_even_numba(value: float) -> int:
+        lower = np.floor(value)
+        fraction = value - lower
+        if fraction < 0.5:
+            return int(lower)
+        if fraction > 0.5:
+            return int(lower + 1.0)
+        lower_int = int(lower)
+        if lower_int % 2 == 0:
+            return lower_int
+        return int(lower + 1.0)
+
+    @njit(cache=True, parallel=True)
+    def _warp_qdf2d_maps_numba(
+        region_map: np.ndarray,
+        hemisphere_map: np.ndarray,
+        minx: np.ndarray,
+        miny: np.ndarray,
+        maxx: np.ndarray,
+        maxy: np.ndarray,
+        target_ax: np.ndarray,
+        target_ay: np.ndarray,
+        decomp: np.ndarray,
+        source_ax: np.ndarray,
+        source_ay: np.ndarray,
+        source_bdx: np.ndarray,
+        source_bdy: np.ndarray,
+        source_cdx: np.ndarray,
+        source_cdy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        height, width = region_map.shape
+        transformed_region = np.zeros(region_map.shape, dtype=np.uint32)
+        transformed_hemi = np.zeros(hemisphere_map.shape, dtype=np.int8)
+        n_triangles = minx.shape[0]
+        for y in prange(height):
+            for x in range(width):
+                sx = float(x)
+                sy = float(y)
+                for tri in range(n_triangles):
+                    xf = float(x)
+                    yf = float(y)
+                    if xf < minx[tri] or xf > maxx[tri] or yf < miny[tri] or yf > maxy[tri]:
+                        continue
+                    dx = xf - target_ax[tri]
+                    dy = yf - target_ay[tri]
+                    u = dx * decomp[tri, 0, 0] + dy * decomp[tri, 0, 1]
+                    v = dx * decomp[tri, 1, 0] + dy * decomp[tri, 1, 1]
+                    if u < 0.0 or u > 1.0 or v < 0.0 or v > 1.0 or (u + v) > 1.0:
+                        continue
+                    sx = source_ax[tri] + source_bdx[tri] * u + source_cdx[tri] * v
+                    sy = source_ay[tri] + source_bdy[tri] * u + source_cdy[tri] * v
+                    break
+                xi = _round_half_to_even_numba(sx)
+                yi = _round_half_to_even_numba(sy)
+                if 0 <= xi < width and 0 <= yi < height:
+                    transformed_region[y, x] = np.uint32(region_map[yi, xi])
+                    transformed_hemi[y, x] = np.int8(hemisphere_map[yi, xi])
+        return transformed_region, transformed_hemi
+else:
+    _warp_qdf2d_maps_numba = None
+
+
+def qdf2d_transform_payload(registration_slice: RegistrationSlice) -> dict[str, object] | None:
+    """Return QDF evo 2D-layer metadata when present on a registration slice."""
+
+    raw = registration_slice.raw if isinstance(registration_slice.raw, dict) else {}
+    payload = raw.get(QDF2D_TRANSFORM_KEY)
+    if not isinstance(payload, dict) or bool(payload.get("_disable")):
+        return None
+    base_anchoring = payload.get("base_anchoring")
+    if not isinstance(base_anchoring, list) or len(base_anchoring) < 9:
+        return None
+    return payload
+
+
+def _base_registration_slice_from_qdf2d(
+    registration_slice: RegistrationSlice,
+    payload: dict[str, object],
+) -> RegistrationSlice:
+    base_anchoring = np.asarray(payload.get("base_anchoring", [])[:9], dtype=np.float64)
+    if base_anchoring.size < 9:
+        base_anchoring = np.concatenate(
+            [
+                np.asarray(registration_slice.origin, dtype=np.float64),
+                np.asarray(registration_slice.u, dtype=np.float64),
+                np.asarray(registration_slice.v, dtype=np.float64),
+            ]
+        )
+    raw = dict(registration_slice.raw or {})
+    raw[QDF2D_TRANSFORM_KEY] = {"_disable": True}
+    return RegistrationSlice(
+        filename=registration_slice.filename,
+        nr=registration_slice.nr,
+        width=registration_slice.width,
+        height=registration_slice.height,
+        origin=base_anchoring[0:3].astype(np.float64, copy=False),
+        u=base_anchoring[3:6].astype(np.float64, copy=False),
+        v=base_anchoring[6:9].astype(np.float64, copy=False),
+        target_resolution=registration_slice.target_resolution,
+        markers=[],
+        raw=raw,
+    )
+
+
+def qdf2d_base_registration_slice(
+    registration_slice: RegistrationSlice,
+    payload: dict[str, object],
+) -> RegistrationSlice:
+    """Return the 3D base-reslice registration slice for a QDF evo 2D-layer slice."""
+
+    return _base_registration_slice_from_qdf2d(registration_slice, payload)
+
+
+def _scaled_marker_rows_for_output(
+    marker_rows: list[list[float]],
+    registration_size: tuple[int, int],
+    output_shape: tuple[int, int],
+    registration_offset_px: tuple[float, float] = (0.0, 0.0),
+    registration_source_shape: tuple[int, int] | None = None,
+) -> list[list[float]]:
+    registration_height, registration_width = registration_size
+    source_height, source_width = registration_source_shape or output_shape
+    scale_x = float(source_width) / float(max(registration_width, 1))
+    scale_y = float(source_height) / float(max(registration_height, 1))
+    offset_x = float(registration_offset_px[0])
+    offset_y = float(registration_offset_px[1])
+    scaled: list[list[float]] = []
+    for row in marker_rows:
+        if len(row) < 4:
+            continue
+        scaled.append(
+            [
+                offset_x + (float(row[0]) * scale_x),
+                offset_y + (float(row[1]) * scale_y),
+                offset_x + (float(row[2]) * scale_x),
+                offset_y + (float(row[3]) * scale_y),
+            ]
+        )
+    return scaled
+
+
+def qdf2d_marker_rows_for_output(
+    registration_slice: RegistrationSlice,
+    payload: dict[str, object],
+    output_shape: tuple[int, int],
+    registration_offset_px: tuple[float, float] = (0.0, 0.0),
+    registration_source_shape: tuple[int, int] | None = None,
+) -> list[list[float]]:
+    """Build output-space marker rows for base-map to final-map 2D warping."""
+
+    registration_height = max(int(registration_slice.height or output_shape[0]), 1)
+    registration_width = max(int(registration_slice.width or output_shape[1]), 1)
+    corner_rows_raw = payload.get("corner_markers")
+    corner_rows = corner_rows_raw if isinstance(corner_rows_raw, list) else []
+    rows: list[list[float]] = []
+    rows.extend(
+        _scaled_marker_rows_for_output(
+            corner_rows,
+            (registration_height, registration_width),
+            output_shape,
+            registration_offset_px=registration_offset_px,
+            registration_source_shape=registration_source_shape,
+        )
+    )
+    rows.extend(
+        _scaled_marker_rows_for_output(
+            registration_slice.markers,
+            (registration_height, registration_width),
+            output_shape,
+            registration_offset_px=registration_offset_px,
+            registration_source_shape=registration_source_shape,
+        )
+    )
+    return rows
+
+
+def apply_qdf2d_transform_to_maps(
+    region_map: np.ndarray,
+    hemisphere_map: np.ndarray,
+    registration_slice: RegistrationSlice,
+    payload: dict[str, object],
+    registration_offset_px: tuple[float, float] = (0.0, 0.0),
+    registration_source_shape: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Apply the saved 2D layer transform to already-resliced base atlas maps."""
+
+    output_shape = tuple(int(value) for value in region_map.shape[:2])
+    height, width = output_shape
+    marker_rows = qdf2d_marker_rows_for_output(
+        registration_slice,
+        payload,
+        output_shape,
+        registration_offset_px=registration_offset_px,
+        registration_source_shape=registration_source_shape,
+    )
+    mapper = build_piecewise_affine_mapper(width, height, marker_rows)
+    metrics = {
+        "qdf2d_layer_enabled": 1.0,
+        "qdf2d_marker_count_used": float(len(marker_rows)),
+        "qdf2d_user_marker_count_used": float(len(registration_slice.markers)),
+    }
+    if mapper is None:
+        return region_map, hemisphere_map, metrics
+
+    use_numba_warp = os.environ.get("QDF_QDF2D_NUMBA_WARP", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if use_numba_warp and _warp_qdf2d_maps_numba is not None:
+        triangles = [triangle for triangle in mapper.triangles if triangle.decomp is not None]
+        if triangles:
+            minx = np.asarray([triangle.minx for triangle in triangles], dtype=np.float64)
+            miny = np.asarray([triangle.miny for triangle in triangles], dtype=np.float64)
+            maxx = np.asarray([triangle.maxx for triangle in triangles], dtype=np.float64)
+            maxy = np.asarray([triangle.maxy for triangle in triangles], dtype=np.float64)
+            target_ax = np.asarray([triangle.target_a[0] for triangle in triangles], dtype=np.float64)
+            target_ay = np.asarray([triangle.target_a[1] for triangle in triangles], dtype=np.float64)
+            decomp = np.asarray([triangle.decomp for triangle in triangles], dtype=np.float64)
+            source_ax = np.asarray([triangle.source_a[0] for triangle in triangles], dtype=np.float64)
+            source_ay = np.asarray([triangle.source_a[1] for triangle in triangles], dtype=np.float64)
+            source_bdx = np.asarray([triangle.source_b_delta[0] for triangle in triangles], dtype=np.float64)
+            source_bdy = np.asarray([triangle.source_b_delta[1] for triangle in triangles], dtype=np.float64)
+            source_cdx = np.asarray([triangle.source_c_delta[0] for triangle in triangles], dtype=np.float64)
+            source_cdy = np.asarray([triangle.source_c_delta[1] for triangle in triangles], dtype=np.float64)
+            transformed_region, transformed_hemi = _warp_qdf2d_maps_numba(
+                region_map.astype(np.uint32, copy=False),
+                hemisphere_map.astype(np.int8, copy=False),
+                minx,
+                miny,
+                maxx,
+                maxy,
+                target_ax,
+                target_ay,
+                decomp,
+                source_ax,
+                source_ay,
+                source_bdx,
+                source_bdy,
+                source_cdx,
+                source_cdy,
+            )
+            metrics["qdf2d_numba_warp"] = 1.0
+            return transformed_region, transformed_hemi, metrics
+
+    transformed_region = np.zeros_like(region_map, dtype=np.uint32)
+    transformed_hemi = np.zeros_like(hemisphere_map, dtype=np.int8)
+    yy, xx = np.meshgrid(
+        np.arange(height, dtype=np.float64),
+        np.arange(width, dtype=np.float64),
+        indexing="ij",
+    )
+    target_points = np.stack([xx, yy], axis=-1)
+    source_points = mapper.map_target_to_source(target_points)
+    xi = np.rint(source_points[..., 0]).astype(np.int32)
+    yi = np.rint(source_points[..., 1]).astype(np.int32)
+    valid = (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
+    if np.any(valid):
+        transformed_region[valid] = region_map[yi[valid], xi[valid]].astype(np.uint32, copy=False)
+        transformed_hemi[valid] = hemisphere_map[yi[valid], xi[valid]].astype(np.int8, copy=False)
+    return transformed_region, transformed_hemi, metrics
+
+
+def _qdf2d_area_scale(payload: dict[str, object]) -> float:
+    base_display = payload.get("base_display")
+    display = payload.get("display")
+    if not isinstance(base_display, dict) or not isinstance(display, dict):
+        return 1.0
+    try:
+        base_span_ml = max(float(base_display.get("span_ml", 1.0)), 1e-6)
+        base_span_dv = max(float(base_display.get("span_dv", 1.0)), 1e-6)
+        span_ml = max(float(display.get("span_ml", base_span_ml)), 1e-6)
+        span_dv = max(float(display.get("span_dv", base_span_dv)), 1e-6)
+    except (TypeError, ValueError):
+        return 1.0
+    return max((base_span_ml / span_ml) * (base_span_dv / span_dv), 1e-6)
+
+
 def build_registered_maps(
     atlas: AtlasRepository,
     registration_slice: RegistrationSlice,
@@ -93,6 +373,47 @@ def build_registered_maps(
     """Rasterize atlas labels and hemisphere assignments into image space."""
 
     atlas.load()
+    qdf2d_payload = qdf2d_transform_payload(registration_slice)
+    if qdf2d_payload is not None:
+        base_slice = _base_registration_slice_from_qdf2d(registration_slice, qdf2d_payload)
+        base_region_map, base_hemisphere_map, base_metrics = build_registered_maps(
+            atlas,
+            base_slice,
+            output_shape,
+            midline_threshold_um=midline_threshold_um,
+            registration_offset_px=registration_offset_px,
+            registration_source_shape=registration_source_shape,
+            chunk_rows=chunk_rows,
+            smooth_regions=smooth_regions,
+            smoothing_kernel_size=smoothing_kernel_size,
+            smoothing_iterations=smoothing_iterations,
+            smoothing_downsample_factor=smoothing_downsample_factor,
+            simplify_contours=simplify_contours,
+            contour_tolerance_px=contour_tolerance_px,
+            contour_min_component_area_px=contour_min_component_area_px,
+            atlas_sampling_mode=atlas_sampling_mode,
+            atlas_sampling_radius_vox=atlas_sampling_radius_vox,
+            atlas_sampling_batch_size=atlas_sampling_batch_size,
+        )
+        region_map, hemisphere_map, qdf2d_metrics = apply_qdf2d_transform_to_maps(
+            base_region_map,
+            base_hemisphere_map,
+            registration_slice,
+            qdf2d_payload,
+            registration_offset_px=registration_offset_px,
+            registration_source_shape=registration_source_shape,
+        )
+        metrics = dict(base_metrics)
+        metrics.update(qdf2d_metrics)
+        area_scale = _qdf2d_area_scale(qdf2d_payload)
+        if "pixel_area_um2" in metrics:
+            metrics["pixel_area_um2"] = float(metrics["pixel_area_um2"]) / area_scale
+        metrics["qdf2d_area_scale"] = float(area_scale)
+        metrics["atlas_coverage_fraction"] = float((region_map > 0).sum() / max(region_map.size, 1))
+        metrics["marker_warp_enabled"] = bool(registration_slice.markers)
+        metrics["marker_count_used"] = int(len(registration_slice.markers))
+        return region_map, hemisphere_map, metrics
+
     labels = atlas.require_labels()
     height, width = output_shape
     registration_height = max(int(registration_slice.height or height), 1)

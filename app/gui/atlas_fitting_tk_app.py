@@ -29,7 +29,14 @@ from atlas.repository import AtlasRepository
 from config.settings import load_app_config
 from data_models.models import RegistrationSlice
 from io_utils.image_io import ensure_rgb, load_image_array
-from overlays.render import build_registered_maps
+from overlays.render import (
+    QDF2D_TRANSFORM_KEY,
+    apply_qdf2d_transform_to_maps,
+    build_registered_maps,
+    qdf2d_base_registration_slice,
+    qdf2d_marker_rows_for_output,
+    qdf2d_transform_payload,
+)
 from registration.nonlinear import (
     build_marker_inverse_warp,
     build_piecewise_affine_mapper,
@@ -56,6 +63,14 @@ class SliceFitState:
     origin_vec: tuple[float, float, float] | None = None
     u_vec: tuple[float, float, float] | None = None
     v_vec: tuple[float, float, float] | None = None
+    base_center_ml: float | None = None
+    base_center_dv: float | None = None
+    base_span_ml: float | None = None
+    base_span_dv: float | None = None
+    base_roll_deg: float | None = None
+    base_origin_vec: tuple[float, float, float] | None = None
+    base_u_vec: tuple[float, float, float] | None = None
+    base_v_vec: tuple[float, float, float] | None = None
     markers: list[list[float]] = field(default_factory=list)
     omit_strokes: list[dict[str, object]] = field(default_factory=list)
 
@@ -76,6 +91,8 @@ class AtlasFittingApp(tk.Tk):
     INTERACTIVE_RENDER_DELAY_MS = 8
     FINAL_RENDER_DELAY_MS = 45
     INTERACTIVE_REFINE_DELAY_MS = 180
+    AUTO_REFINE_2D_LAYER_MS = int(os.environ.get("QDF_ATLASFITTER_2D_REFINE_MS", "180") or "180")
+    CONTOUR_LAYER_PREVIEW_ENABLED = False
 
     def __init__(self, app_name: str = "QDFevo_2_AtlasFitter") -> None:
         super().__init__()
@@ -134,6 +151,13 @@ class AtlasFittingApp(tk.Tk):
         self._current_boundary_alpha_values: np.ndarray | None = None
         self._current_boundary_contours: list[np.ndarray] = []
         self._current_base_signature: tuple[str, tuple[int, int], tuple[int, int]] | None = None
+        self._atlas_base_map_cache_key: tuple[object, ...] | None = None
+        self._atlas_base_map_cache: tuple[np.ndarray, np.ndarray, dict[str, float]] | None = None
+        self._atlas_base_contour_cache_key: tuple[object, str] | None = None
+        self._atlas_base_contour_cache: list[np.ndarray] = []
+        self._atlas_base_boundary_cache_key: tuple[object, ...] | None = None
+        self._atlas_base_boundary_points: np.ndarray | None = None
+        self._atlas_base_boundary_values: np.ndarray | None = None
         self.current_region_map: np.ndarray | None = None
         self.current_display_offset = (0.0, 0.0)
         self.current_image_offset_in_composite = (0.0, 0.0)
@@ -592,6 +616,120 @@ class AtlasFittingApp(tk.Tk):
     def _clone_state_map(self) -> dict[str, SliceFitState]:
         return {name: self._clone_state(state) for name, state in self.slice_states.items()}
 
+    def _base_vectors_for_state(self, state: SliceFitState) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if state.base_origin_vec is not None and state.base_u_vec is not None and state.base_v_vec is not None:
+            return (
+                np.asarray(state.base_origin_vec, dtype=np.float64),
+                np.asarray(state.base_u_vec, dtype=np.float64),
+                np.asarray(state.base_v_vec, dtype=np.float64),
+            )
+        return self._vectors_for_state(state)
+
+    def _state_with_base_from(self, state: SliceFitState, base_state: SliceFitState) -> SliceFitState:
+        base_origin, base_u, base_v = self._base_vectors_for_state(base_state)
+        return replace(
+            state,
+            base_center_ml=float(base_state.base_center_ml if base_state.base_center_ml is not None else base_state.center_ml),
+            base_center_dv=float(base_state.base_center_dv if base_state.base_center_dv is not None else base_state.center_dv),
+            base_span_ml=float(base_state.base_span_ml if base_state.base_span_ml is not None else base_state.span_ml),
+            base_span_dv=float(base_state.base_span_dv if base_state.base_span_dv is not None else base_state.span_dv),
+            base_roll_deg=float(base_state.base_roll_deg if base_state.base_roll_deg is not None else base_state.roll_deg),
+            base_origin_vec=tuple(float(value) for value in base_origin),
+            base_u_vec=tuple(float(value) for value in base_u),
+            base_v_vec=tuple(float(value) for value in base_v),
+        )
+
+    def _state_needs_3d_rebase(self, old_state: SliceFitState, new_state: SliceFitState) -> bool:
+        return (
+            abs(float(old_state.center_ap) - float(new_state.center_ap)) > 1e-6
+            or abs(float(old_state.tilt_ml_deg) - float(new_state.tilt_ml_deg)) > 1e-6
+            or abs(float(old_state.tilt_dv_deg) - float(new_state.tilt_dv_deg)) > 1e-6
+        )
+
+    def _qdf2d_corner_markers_for_state(
+        self,
+        state: SliceFitState,
+        registration_width: int,
+        registration_height: int,
+    ) -> list[list[float]]:
+        base_center_ml = float(state.base_center_ml if state.base_center_ml is not None else state.center_ml)
+        base_center_dv = float(state.base_center_dv if state.base_center_dv is not None else state.center_dv)
+        base_span_ml = max(float(state.base_span_ml if state.base_span_ml is not None else state.span_ml), 1e-6)
+        base_span_dv = max(float(state.base_span_dv if state.base_span_dv is not None else state.span_dv), 1e-6)
+        base_roll = float(state.base_roll_deg if state.base_roll_deg is not None else state.roll_deg)
+        width = float(max(int(registration_width), 1))
+        height = float(max(int(registration_height), 1))
+        center = np.asarray([width * 0.5, height * 0.5], dtype=np.float64)
+        translate = np.asarray(
+            [
+                ((float(state.center_ml) - base_center_ml) / base_span_ml) * width,
+                ((float(state.center_dv) - base_center_dv) / base_span_dv) * height,
+            ],
+            dtype=np.float64,
+        )
+        scale = np.asarray(
+            [
+                base_span_ml / max(float(state.span_ml), 1e-6),
+                base_span_dv / max(float(state.span_dv), 1e-6),
+            ],
+            dtype=np.float64,
+        )
+        theta = math.radians(float(state.roll_deg) - base_roll)
+        rotation = np.asarray(
+            [
+                [math.cos(theta), -math.sin(theta)],
+                [math.sin(theta), math.cos(theta)],
+            ],
+            dtype=np.float64,
+        )
+        corners = [
+            np.asarray([0.0, 0.0], dtype=np.float64),
+            np.asarray([width, 0.0], dtype=np.float64),
+            np.asarray([width, height], dtype=np.float64),
+            np.asarray([0.0, height], dtype=np.float64),
+        ]
+        rows: list[list[float]] = []
+        for source in corners:
+            target = center + translate + (rotation @ ((source - center) * scale))
+            rows.append([float(source[0]), float(source[1]), float(target[0]), float(target[1])])
+        return rows
+
+    def _qdf2d_payload_for_state(
+        self,
+        state: SliceFitState,
+        registration_width: int,
+        registration_height: int,
+    ) -> dict[str, object]:
+        base_origin, base_u, base_v = self._base_vectors_for_state(state)
+        base_center_ml = float(state.base_center_ml if state.base_center_ml is not None else state.center_ml)
+        base_center_dv = float(state.base_center_dv if state.base_center_dv is not None else state.center_dv)
+        base_span_ml = float(state.base_span_ml if state.base_span_ml is not None else state.span_ml)
+        base_span_dv = float(state.base_span_dv if state.base_span_dv is not None else state.span_dv)
+        base_roll = float(state.base_roll_deg if state.base_roll_deg is not None else state.roll_deg)
+        return {
+            "version": 1,
+            "mode": "base3d_plus_2d_layer",
+            "registration_size": [int(registration_width), int(registration_height)],
+            "base_anchoring": [float(value) for value in base_origin]
+            + [float(value) for value in base_u]
+            + [float(value) for value in base_v],
+            "base_display": {
+                "center_ml": base_center_ml,
+                "center_dv": base_center_dv,
+                "span_ml": base_span_ml,
+                "span_dv": base_span_dv,
+                "roll_deg": base_roll,
+            },
+            "display": {
+                "center_ml": float(state.center_ml),
+                "center_dv": float(state.center_dv),
+                "span_ml": float(state.span_ml),
+                "span_dv": float(state.span_dv),
+                "roll_deg": float(state.roll_deg),
+            },
+            "corner_markers": self._qdf2d_corner_markers_for_state(state, registration_width, registration_height),
+        }
+
     def _update_saved_snapshot(self) -> None:
         self.saved_slice_states = self._clone_state_map()
 
@@ -637,7 +775,7 @@ class AtlasFittingApp(tk.Tk):
         origin, u, v = self._vectors_for_state(state)
         delta = np.asarray(delta_xyz, dtype=np.float64)
         new_origin = origin + delta
-        return SliceFitState(
+        new_state = SliceFitState(
             center_ml=float(state.center_ml + delta[0]),
             center_ap=float(state.center_ap + delta[1]),
             center_dv=float(state.center_dv + delta[2]),
@@ -654,10 +792,13 @@ class AtlasFittingApp(tk.Tk):
             markers=[list(marker) for marker in state.markers],
             omit_strokes=[self._clone_omit_stroke(stroke) for stroke in state.omit_strokes],
         )
+        if abs(float(delta[1])) <= 1e-12:
+            return self._state_with_base_from(new_state, state)
+        return new_state
 
     def _copy_state_with_markers(self, state: SliceFitState, markers: list[list[float]]) -> SliceFitState:
         origin, u, v = self._vectors_for_state(state)
-        return SliceFitState(
+        new_state = SliceFitState(
             center_ml=float(state.center_ml),
             center_ap=float(state.center_ap),
             center_dv=float(state.center_dv),
@@ -674,10 +815,11 @@ class AtlasFittingApp(tk.Tk):
             markers=[list(marker) for marker in markers],
             omit_strokes=[self._clone_omit_stroke(stroke) for stroke in state.omit_strokes],
         )
+        return self._state_with_base_from(new_state, state)
 
     def _copy_state_with_omit_strokes(self, state: SliceFitState, omit_strokes: list[dict[str, object]]) -> SliceFitState:
         origin, u, v = self._vectors_for_state(state)
-        return SliceFitState(
+        new_state = SliceFitState(
             center_ml=float(state.center_ml),
             center_ap=float(state.center_ap),
             center_dv=float(state.center_dv),
@@ -694,6 +836,7 @@ class AtlasFittingApp(tk.Tk):
             markers=[list(marker) for marker in state.markers],
             omit_strokes=[self._clone_omit_stroke(stroke) for stroke in omit_strokes],
         )
+        return self._state_with_base_from(new_state, state)
 
     def _shift_pressed(self, event: tk.Event) -> bool:
         return bool(int(event.state) & 0x0001)
@@ -870,6 +1013,13 @@ class AtlasFittingApp(tk.Tk):
         self.current_preview_shape = None
         self.current_region_map = None
         self._current_boundary_contours = []
+        self._atlas_base_map_cache_key = None
+        self._atlas_base_map_cache = None
+        self._atlas_base_contour_cache_key = None
+        self._atlas_base_contour_cache = []
+        self._atlas_base_boundary_cache_key = None
+        self._atlas_base_boundary_points = None
+        self._atlas_base_boundary_values = None
         self.view_zoom_factor = 1.0
         self.current_display_offset = (0.0, 0.0)
         self._preview_overlay_shift = (0.0, 0.0)
@@ -924,13 +1074,14 @@ class AtlasFittingApp(tk.Tk):
         try:
             current_markers: list[list[float]] = []
             current_omit_strokes: list[dict[str, object]] = []
+            current_state: SliceFitState | None = None
             if 0 <= self.current_index < len(self.image_paths):
                 current_state = self.slice_states[self.image_paths[self.current_index].name]
                 if self._controls_match_state(current_state):
                     return self._clone_state(current_state)
                 current_markers = [list(marker) for marker in current_state.markers]
                 current_omit_strokes = [self._clone_omit_stroke(stroke) for stroke in current_state.omit_strokes]
-            return self._state_from_display_values(
+            new_state = self._state_from_display_values(
                 center_ml=float(self.center_ml_var.get().strip()),
                 center_ap=self._ap_bregma_um_to_vox(float(self.ap_var.get().strip())),
                 center_dv=float(self.center_dv_var.get().strip()),
@@ -941,9 +1092,12 @@ class AtlasFittingApp(tk.Tk):
                 roll_deg=float(self.roll_var.get().strip()),
                 markers=current_markers,
                 omit_strokes=current_omit_strokes,
-                registration_width=current_state.registration_width,
-                registration_height=current_state.registration_height,
+                registration_width=None if current_state is None else current_state.registration_width,
+                registration_height=None if current_state is None else current_state.registration_height,
             )
+            if current_state is not None and not self._state_needs_3d_rebase(current_state, new_state):
+                return self._state_with_base_from(new_state, current_state)
+            return new_state
         except ValueError:
             return None
 
@@ -991,6 +1145,14 @@ class AtlasFittingApp(tk.Tk):
             origin_vec=tuple(float(value) for value in origin),
             u_vec=tuple(float(value) for value in u),
             v_vec=tuple(float(value) for value in v),
+            base_center_ml=provisional.center_ml,
+            base_center_dv=provisional.center_dv,
+            base_span_ml=provisional.span_ml,
+            base_span_dv=provisional.span_dv,
+            base_roll_deg=provisional.roll_deg,
+            base_origin_vec=tuple(float(value) for value in origin),
+            base_u_vec=tuple(float(value) for value in u),
+            base_v_vec=tuple(float(value) for value in v),
             markers=[list(marker) for marker in provisional.markers],
             omit_strokes=[self._clone_omit_stroke(stroke) for stroke in provisional.omit_strokes],
         )
@@ -1103,6 +1265,14 @@ class AtlasFittingApp(tk.Tk):
             origin_vec=tuple(float(value) for value in origin),
             u_vec=tuple(float(value) for value in u),
             v_vec=tuple(float(value) for value in v),
+            base_center_ml=float(center[0]),
+            base_center_dv=float(center[2]),
+            base_span_ml=span_ml,
+            base_span_dv=span_dv,
+            base_roll_deg=float(angles[2]),
+            base_origin_vec=tuple(float(value) for value in origin),
+            base_u_vec=tuple(float(value) for value in u),
+            base_v_vec=tuple(float(value) for value in v),
             markers=[list(marker) for marker in (markers or [])],
             omit_strokes=[self._clone_omit_stroke(stroke) for stroke in (omit_strokes or [])],
         )
@@ -1137,17 +1307,24 @@ class AtlasFittingApp(tk.Tk):
     def _on_transform_commit(self, _event: object | None = None) -> None:
         if self._ignore_var_updates or not (0 <= self.current_index < len(self.image_paths)):
             return
+        current_state = self.slice_states[self.image_paths[self.current_index].name]
         state = self._read_state_from_controls()
         if state is None:
             self.status_var.set("Invalid transform value")
             return
         self.slice_states[self.image_paths[self.current_index].name] = state
+        if not self._state_needs_3d_rebase(current_state, state):
+            self._set_preview_mode(True, reason="2D transform")
+            self._schedule_render(interactive=True)
+            self._schedule_2d_layer_refine_render()
+            return
         self._set_preview_mode(False)
         self._schedule_render()
 
     def _on_canvas_left_press(self, event: tk.Event) -> None:
         if not (0 <= self.current_index < len(self.image_paths)):
             return
+        self._cancel_refine_render()
         if self.marker_mode_var.get() == "omit":
             self._last_canvas_xy = (float(event.x), float(event.y))
             if self.omit_draw_mode_var.get() == "polygon":
@@ -1234,6 +1411,7 @@ class AtlasFittingApp(tk.Tk):
     def _on_canvas_left_release(self, event: tk.Event) -> None:
         if self._drag_mode == "pan":
             self._preview_overlay_shift = (0.0, 0.0)
+            self._drag_mode = None
             if 0 <= self.current_index < len(self.image_paths):
                 current_state = self.slice_states.get(self.image_paths[self.current_index].name)
                 if current_state is not None:
@@ -1268,6 +1446,7 @@ class AtlasFittingApp(tk.Tk):
     def _on_canvas_right_press(self, event: tk.Event) -> None:
         if not (0 <= self.current_index < len(self.image_paths)):
             return
+        self._cancel_refine_render()
         if self.marker_mode_var.get() == "omit" and self.omit_draw_mode_var.get() == "polygon":
             self._last_canvas_xy = (float(event.x), float(event.y))
             self._complete_polygon_omit()
@@ -1520,6 +1699,7 @@ class AtlasFittingApp(tk.Tk):
             self._update_marker_preview_only(base_state, new_state)
         else:
             self._draw_marker_canvas_items(new_state)
+        self._schedule_render(interactive=False, delay_ms=1)
         self._update_preview_note()
         self.status_var.set("Marker added (preview mode)")
         self._append_log(f"Added marker on {self.image_paths[self.current_index].name}")
@@ -1755,7 +1935,6 @@ class AtlasFittingApp(tk.Tk):
         image_path = self.image_paths[self.current_index]
         image_shape = self.image_sizes[image_path.name]
         registration_slice = self._registration_slice_for(image_path, state, use_preview=False)
-        mapper = build_marker_inverse_warp(registration_slice, image_shape)
         registration_xy = np.asarray(
             [
                 float(full_xy[0]) * (float(registration_slice.width) / float(max(image_shape[1], 1))),
@@ -1763,6 +1942,13 @@ class AtlasFittingApp(tk.Tk):
             ],
             dtype=np.float64,
         )
+        payload = registration_slice.raw.get(QDF2D_TRANSFORM_KEY) if isinstance(registration_slice.raw, dict) else None
+        if isinstance(payload, dict):
+            marker_rows = [list(row) for row in payload.get("corner_markers", []) if isinstance(row, list) and len(row) >= 4]
+            marker_rows.extend([list(marker) for marker in registration_slice.markers if len(marker) >= 4])
+            mapper = build_piecewise_affine_mapper(registration_slice.width, registration_slice.height, marker_rows)
+        else:
+            mapper = build_marker_inverse_warp(registration_slice, image_shape)
         if mapper is None:
             return registration_xy
         mapped = mapper.transform_point(registration_xy)
@@ -1904,6 +2090,193 @@ class AtlasFittingApp(tk.Tk):
     def _cache_boundary_preview_geometry(self, alpha_array: np.ndarray) -> None:
         self._cache_boundary_points(alpha_array)
         self._cache_boundary_contours(alpha_array)
+
+    def _contours_from_region_map(
+        self,
+        region_map: np.ndarray,
+        quality: str = "low",
+    ) -> list[np.ndarray]:
+        if find_contours is None:
+            return []
+        region = np.asarray(region_map)
+        if region.size == 0 or not np.any(region > 0):
+            return []
+        boundaries = np.zeros(region.shape, dtype=bool)
+        boundaries[1:, :] |= region[1:, :] != region[:-1, :]
+        boundaries[:, 1:] |= region[:, 1:] != region[:, :-1]
+        boundaries &= region > 0
+        if not np.any(boundaries):
+            return []
+        tolerance = 1.4 if quality == "high" else 2.2
+        max_points = 1800 if quality == "high" else 900
+        contours: list[np.ndarray] = []
+        for contour in find_contours(boundaries.astype(np.uint8), 0.5):
+            if contour.shape[0] < 4:
+                continue
+            if approximate_polygon is not None:
+                contour = approximate_polygon(contour, tolerance=tolerance)
+            if contour.shape[0] < 4:
+                continue
+            if contour.shape[0] > max_points:
+                stride = max(1, int(math.ceil(contour.shape[0] / float(max_points))))
+                contour = contour[::stride]
+            xy = np.column_stack((contour[:, 1], contour[:, 0])).astype(np.float64)
+            if xy.shape[0] >= 4:
+                contours.append(xy)
+        return contours
+
+    def _base_contours_for_layer(self, quality: str = "low") -> list[np.ndarray]:
+        if not self.CONTOUR_LAYER_PREVIEW_ENABLED or self._atlas_base_map_cache_key is None or self._atlas_base_map_cache is None:
+            return []
+        base_region_map, _base_hemi, _base_metrics = self._atlas_base_map_cache
+        expected_shape = self.current_composite_shape
+        if expected_shape is None or tuple(base_region_map.shape[:2]) != tuple(expected_shape):
+            return []
+        cache_key = (self._atlas_base_map_cache_key, str(quality))
+        if self._atlas_base_contour_cache_key == cache_key and self._atlas_base_contour_cache:
+            return [contour.copy() for contour in self._atlas_base_contour_cache]
+        contours = self._contours_from_region_map(base_region_map, quality=quality)
+        self._atlas_base_contour_cache_key = cache_key
+        self._atlas_base_contour_cache = [contour.copy() for contour in contours]
+        return contours
+
+    def _base_boundary_points_for_layer(self) -> tuple[np.ndarray, np.ndarray] | None:
+        if not self.CONTOUR_LAYER_PREVIEW_ENABLED or self._atlas_base_map_cache_key is None or self._atlas_base_map_cache is None:
+            return None
+        base_region_map, _base_hemi, _base_metrics = self._atlas_base_map_cache
+        expected_shape = self.current_composite_shape
+        if expected_shape is None or tuple(base_region_map.shape[:2]) != tuple(expected_shape):
+            return None
+        cache_key = (self._atlas_base_map_cache_key, "boundary_points")
+        if (
+            self._atlas_base_boundary_cache_key == cache_key
+            and self._atlas_base_boundary_points is not None
+            and self._atlas_base_boundary_values is not None
+        ):
+            return self._atlas_base_boundary_points, self._atlas_base_boundary_values
+        boundaries = self._boundary_mask(base_region_map)
+        ys, xs = np.nonzero(boundaries)
+        if xs.size == 0:
+            return None
+        points = np.column_stack((xs, ys)).astype(np.float64)
+        alpha_value = max(190, int(round(255.0 * max(self._effective_atlas_opacity(), 0.75))))
+        values = np.full(points.shape[0], min(alpha_value, 255), dtype=np.uint8)
+        self._atlas_base_boundary_cache_key = cache_key
+        self._atlas_base_boundary_points = points
+        self._atlas_base_boundary_values = values
+        return points, values
+
+    def _qdf2d_marker_rows_for_current_display(self, state: SliceFitState) -> list[list[float]]:
+        if not (0 <= self.current_index < len(self.image_paths)):
+            return []
+        path = self.image_paths[self.current_index]
+        composite_shape = self.current_composite_shape or self.current_preview_shape
+        render_shape = self.current_preview_shape or self.image_sizes[path.name]
+        if composite_shape is None:
+            return []
+        pad_x = float(self.current_image_offset_in_composite[0])
+        pad_y = float(self.current_image_offset_in_composite[1])
+        preview_slice = self._registration_slice_for(
+            path,
+            state,
+            use_preview=True,
+            preview_shape=composite_shape,
+            preview_image_shape=render_shape,
+            preview_padding=(int(round(pad_x)), int(round(pad_y))),
+        )
+        preview_slice, _, _ = self.atlas.adapted_registration_slice(preview_slice)
+        payload = qdf2d_transform_payload(preview_slice)
+        if payload is None:
+            return []
+        return qdf2d_marker_rows_for_output(
+            preview_slice,
+            payload,
+            composite_shape,
+            registration_offset_px=(pad_x, pad_y),
+            registration_source_shape=render_shape,
+        )
+
+    def _warp_base_contours_to_state(
+        self,
+        contours: list[np.ndarray],
+        state: SliceFitState,
+    ) -> list[np.ndarray] | None:
+        composite_shape = self.current_composite_shape
+        if composite_shape is None or not contours:
+            return None
+        marker_rows = self._qdf2d_marker_rows_for_current_display(state)
+        if not marker_rows:
+            return None
+        swapped_rows = [
+            [float(row[2]), float(row[3]), float(row[0]), float(row[1])]
+            for row in marker_rows
+            if len(row) >= 4
+        ]
+        mapper = build_piecewise_affine_mapper(int(composite_shape[1]), int(composite_shape[0]), swapped_rows)
+        if mapper is None:
+            return None
+        warped: list[np.ndarray] = []
+        for contour in contours:
+            if contour.shape[0] < 2:
+                continue
+            mapped = mapper.map_target_to_source(contour)
+            if mapped.shape[0] >= 2:
+                warped.append(mapped)
+        return warped or None
+
+    def _warp_base_boundary_alpha_to_state(self, state: SliceFitState) -> np.ndarray | None:
+        composite_shape = self.current_composite_shape
+        boundary_cache = self._base_boundary_points_for_layer()
+        if composite_shape is None or boundary_cache is None:
+            return None
+        boundary_points, boundary_values = boundary_cache
+        if boundary_points.size == 0:
+            return None
+        marker_rows = self._qdf2d_marker_rows_for_current_display(state)
+        if not marker_rows:
+            return None
+        swapped_rows = [
+            [float(row[2]), float(row[3]), float(row[0]), float(row[1])]
+            for row in marker_rows
+            if len(row) >= 4
+        ]
+        width = int(composite_shape[1])
+        height = int(composite_shape[0])
+        mapper = build_piecewise_affine_mapper(width, height, swapped_rows)
+        if mapper is None:
+            return None
+        mapped = mapper.map_target_to_source(boundary_points)
+        xi = np.rint(mapped[:, 0]).astype(np.int32)
+        yi = np.rint(mapped[:, 1]).astype(np.int32)
+        out = np.zeros((height, width), dtype=np.uint8)
+        flat = out.ravel()
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                xj = xi + dx
+                yj = yi + dy
+                inside = (xj >= 0) & (xj < width) & (yj >= 0) & (yj < height)
+                if np.any(inside):
+                    np.maximum.at(flat, yj[inside] * width + xj[inside], boundary_values[inside])
+        return out
+
+    def _update_2d_layer_contour_preview(self, state: SliceFitState, quality: str = "low") -> bool:
+        if quality == "low":
+            warped_alpha = self._warp_base_boundary_alpha_to_state(state)
+            if warped_alpha is not None:
+                self._preview_overlay_shift = (0.0, 0.0)
+                self._apply_atlas_overlay_alpha(warped_alpha, shift_xy=(0.0, 0.0))
+                self._draw_marker_canvas_items(state)
+                self._update_preview_note()
+                return True
+        contours = self._base_contours_for_layer(quality=quality)
+        warped_contours = self._warp_base_contours_to_state(contours, state)
+        if warped_contours is None:
+            return False
+        self._preview_overlay_shift = (0.0, 0.0)
+        self._draw_preview_contours(warped_contours, shift_xy=(0.0, 0.0))
+        self._draw_marker_canvas_items(state)
+        self._update_preview_note()
+        return True
 
     def _atlas_overlay_from_alpha(self, alpha_array: np.ndarray) -> Image.Image:
         alpha_u8 = np.clip(np.asarray(alpha_array, dtype=np.float64), 0.0, 255.0).astype(np.uint8)
@@ -2056,7 +2429,7 @@ class AtlasFittingApp(tk.Tk):
         width = int(image_size[0])
         height = int(image_size[1])
         flat = out.ravel()
-        for dx, dy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+        for dx, dy in ((0, 0),):
             xj = xi + dx
             yj = yi + dy
             inside = (xj >= 0) & (xj < width) & (yj >= 0) & (yj < height)
@@ -2170,8 +2543,10 @@ class AtlasFittingApp(tk.Tk):
             return False
         markers = [list(marker) for marker in state.markers]
         markers.pop(best_index)
-        origin, u, v = self._vectors_for_state(state)
-        self._set_state_for_current_slice(self._copy_state_with_markers(state, markers), schedule=True)
+        updated_state = self._copy_state_with_markers(state, markers)
+        self._set_state_for_current_slice(updated_state, schedule=False)
+        self._set_preview_mode(False)
+        self._schedule_render(interactive=False, delay_ms=1)
         self._append_log(f"Removed marker on {name}")
         return True
 
@@ -2208,10 +2583,8 @@ class AtlasFittingApp(tk.Tk):
         markers = [list(marker) for marker in state.markers]
         markers.pop(index)
         self._selected_marker_index = None
-        self._set_state_for_current_slice(self._copy_state_with_markers(state, markers), schedule=False)
-        self._clear_marker_canvas_items()
-        self._clear_preview_contour_items()
-        self._set_atlas_overlay_visibility(True)
+        updated_state = self._copy_state_with_markers(state, markers)
+        self._set_state_for_current_slice(updated_state, schedule=False)
         self._set_preview_mode(False)
         self._schedule_render(interactive=False, delay_ms=1)
         self.status_var.set("Marker deleted")
@@ -2223,10 +2596,8 @@ class AtlasFittingApp(tk.Tk):
         name = self.image_paths[self.current_index].name
         state = self.slice_states[name]
         self._selected_marker_index = None
-        self._set_state_for_current_slice(self._copy_state_with_markers(state, []), schedule=False)
-        self._clear_marker_canvas_items()
-        self._clear_preview_contour_items()
-        self._set_atlas_overlay_visibility(True)
+        updated_state = self._copy_state_with_markers(state, [])
+        self._set_state_for_current_slice(updated_state, schedule=False)
         self._set_preview_mode(False)
         self._schedule_render(interactive=False, delay_ms=1)
         self.status_var.set("Cleared markers")
@@ -2236,6 +2607,7 @@ class AtlasFittingApp(tk.Tk):
         state = self._read_state_from_controls()
         if state is None:
             return
+        base_state = self._clone_state(state)
         delta_sign = 1.0 if direction >= 0 else -1.0
         if field_label == "AP (Bregma um)":
             self._set_preview_mode(False)
@@ -2263,8 +2635,11 @@ class AtlasFittingApp(tk.Tk):
                 registration_width=state.registration_width,
                 registration_height=state.registration_height,
             )
-            self._set_preview_mode(False)
-            self._set_state_for_current_slice(state, schedule=True)
+            state = self._state_with_base_from(state, base_state)
+            self._set_state_for_current_slice(state, schedule=False)
+            self._set_preview_mode(True, reason="2D size transform")
+            self._schedule_render(interactive=True)
+            self._schedule_2d_layer_refine_render()
             return
         if kind == "linear":
             delta = self._linear_step_vox(20.0) * delta_sign
@@ -2279,10 +2654,7 @@ class AtlasFittingApp(tk.Tk):
         elif field_label == "Tilt DV deg":
             state.tilt_dv_deg += delta
         elif field_label == "Roll deg":
-            state = self._rolled_state_from_vectors(state, delta)
-            self._set_preview_mode(False)
-            self._set_state_for_current_slice(state, schedule=True)
-            return
+            state.roll_deg += delta
         state = self._state_from_display_values(
             center_ml=state.center_ml,
             center_ap=state.center_ap,
@@ -2297,6 +2669,13 @@ class AtlasFittingApp(tk.Tk):
             registration_width=state.registration_width,
             registration_height=state.registration_height,
         )
+        if field_label in {"Center ML", "Center DV", "Roll deg"}:
+            state = self._state_with_base_from(state, base_state)
+            self._set_state_for_current_slice(state, schedule=False)
+            self._set_preview_mode(True, reason="2D transform")
+            self._schedule_render(interactive=True)
+            self._schedule_2d_layer_refine_render()
+            return
         self._set_preview_mode(False)
         self._set_state_for_current_slice(state, schedule=True)
 
@@ -2387,9 +2766,26 @@ class AtlasFittingApp(tk.Tk):
         state = self._read_state_from_controls()
         if state is None:
             return
-        state = self._rolled_state_from_vectors(state, float(delta))
-        self._set_preview_mode(False)
-        self._set_state_for_current_slice(state, schedule=True)
+        base_state = self._clone_state(state)
+        state = self._state_from_display_values(
+            center_ml=state.center_ml,
+            center_ap=state.center_ap,
+            center_dv=state.center_dv,
+            span_ml=state.span_ml,
+            span_dv=state.span_dv,
+            tilt_ml_deg=state.tilt_ml_deg,
+            tilt_dv_deg=state.tilt_dv_deg,
+            roll_deg=state.roll_deg + float(delta),
+            markers=state.markers,
+            omit_strokes=state.omit_strokes,
+            registration_width=state.registration_width,
+            registration_height=state.registration_height,
+        )
+        state = self._state_with_base_from(state, base_state)
+        self._set_state_for_current_slice(state, schedule=False)
+        self._set_preview_mode(True, reason="2D roll transform")
+        self._schedule_render(interactive=True)
+        self._schedule_2d_layer_refine_render()
         self.status_var.set("Adjusted roll")
 
     def _apply_zoom(self, factor: float) -> None:
@@ -2505,7 +2901,13 @@ class AtlasFittingApp(tk.Tk):
             v=v,
             target_resolution=self.current_target_resolution,
             markers=markers,
-            raw={},
+            raw={
+                QDF2D_TRANSFORM_KEY: self._qdf2d_payload_for_state(
+                    state,
+                    out_width,
+                    out_height,
+                )
+            },
         )
 
     def _schedule_render(self, interactive: bool = False, delay_ms: int | None = None) -> None:
@@ -2538,6 +2940,25 @@ class AtlasFittingApp(tk.Tk):
             if rid == self._render_request_id
             else None,
         )
+
+    def _schedule_2d_layer_refine_render(self) -> None:
+        delay_ms = int(self.AUTO_REFINE_2D_LAYER_MS)
+        if delay_ms <= 0:
+            return
+        if self._refine_after_id is not None:
+            self.after_cancel(self._refine_after_id)
+        current_request_id = self._render_request_id
+        self._refine_after_id = self.after(
+            delay_ms,
+            lambda rid=current_request_id: self._schedule_render(interactive=False, delay_ms=self.FINAL_RENDER_DELAY_MS)
+            if rid == self._render_request_id
+            else None,
+        )
+
+    def _cancel_refine_render(self) -> None:
+        if self._refine_after_id is not None:
+            self.after_cancel(self._refine_after_id)
+            self._refine_after_id = None
 
     def _ensure_canvas_base_layer(
         self,
@@ -2575,6 +2996,89 @@ class AtlasFittingApp(tk.Tk):
                 self.current_display_offset[1],
             )
         self._current_base_signature = signature
+
+    def _build_registered_maps_with_2d_cache(
+        self,
+        preview_slice: RegistrationSlice,
+        atlas_preview_shape: tuple[int, int],
+        registration_offset_px: tuple[float, float],
+        registration_source_shape: tuple[int, int],
+        interactive: bool,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+        payload = qdf2d_transform_payload(preview_slice)
+        common_kwargs = {
+            "midline_threshold_um": 75.0,
+            "registration_offset_px": registration_offset_px,
+            "registration_source_shape": registration_source_shape,
+            "chunk_rows": 80 if interactive else 128,
+            "smooth_regions": not interactive,
+            "smoothing_kernel_size": 5,
+            "smoothing_iterations": 1,
+            "smoothing_downsample_factor": 2,
+            "simplify_contours": False,
+            "contour_tolerance_px": 2.5,
+            "contour_min_component_area_px": 128,
+            "atlas_sampling_mode": "nearest",
+            "atlas_sampling_radius_vox": 2,
+            "atlas_sampling_batch_size": 4096,
+        }
+        if payload is None:
+            return build_registered_maps(
+                self.atlas,
+                preview_slice,
+                atlas_preview_shape,
+                **common_kwargs,
+            )
+
+        base_slice = qdf2d_base_registration_slice(preview_slice, payload)
+        base_values = tuple(
+            round(float(value), 5)
+            for value in np.concatenate(
+                [
+                    np.asarray(base_slice.origin, dtype=np.float64),
+                    np.asarray(base_slice.u, dtype=np.float64),
+                    np.asarray(base_slice.v, dtype=np.float64),
+                ]
+            )
+        )
+        cache_key = (
+            str(getattr(self.atlas.config, "labels_path", "")),
+            tuple(int(value) for value in self.current_target_resolution),
+            preview_slice.filename,
+            tuple(int(value) for value in atlas_preview_shape),
+            tuple(round(float(value), 3) for value in registration_offset_px),
+            tuple(int(value) for value in registration_source_shape),
+            bool(interactive),
+            base_values,
+        )
+        if self._atlas_base_map_cache_key == cache_key and self._atlas_base_map_cache is not None:
+            base_region_map, base_hemisphere_map, base_metrics = self._atlas_base_map_cache
+        else:
+            base_region_map, base_hemisphere_map, base_metrics = build_registered_maps(
+                self.atlas,
+                base_slice,
+                atlas_preview_shape,
+                **common_kwargs,
+            )
+            self._atlas_base_map_cache_key = cache_key
+            self._atlas_base_map_cache = (base_region_map, base_hemisphere_map, dict(base_metrics))
+            self._atlas_base_contour_cache_key = None
+            self._atlas_base_contour_cache = []
+            self._atlas_base_boundary_cache_key = None
+            self._atlas_base_boundary_points = None
+            self._atlas_base_boundary_values = None
+        region_map, hemisphere_map, qdf2d_metrics = apply_qdf2d_transform_to_maps(
+            base_region_map,
+            base_hemisphere_map,
+            preview_slice,
+            payload,
+            registration_offset_px=registration_offset_px,
+            registration_source_shape=registration_source_shape,
+        )
+        metrics = dict(base_metrics)
+        metrics.update(qdf2d_metrics)
+        metrics["atlas_coverage_fraction"] = float((region_map > 0).sum() / max(region_map.size, 1))
+        return region_map, hemisphere_map, metrics
 
     def _render_current_slice(self, request_id: int) -> None:
         self._render_after_id = None
@@ -2627,24 +3131,12 @@ class AtlasFittingApp(tk.Tk):
                 preview_padding=(atlas_preview_pad_x, atlas_preview_pad_y),
             )
             preview_slice, _, _ = self.atlas.adapted_registration_slice(preview_slice)
-            region_map, _, render_metrics = build_registered_maps(
-                self.atlas,
+            region_map, _, render_metrics = self._build_registered_maps_with_2d_cache(
                 preview_slice,
                 atlas_preview_shape,
-                midline_threshold_um=75.0,
                 registration_offset_px=(float(atlas_preview_pad_x), float(atlas_preview_pad_y)),
                 registration_source_shape=preview_render_shape,
-                chunk_rows=80 if interactive else 128,
-                smooth_regions=not interactive,
-                smoothing_kernel_size=5,
-                smoothing_iterations=1,
-                smoothing_downsample_factor=2,
-                simplify_contours=False,
-                contour_tolerance_px=2.5,
-                contour_min_component_area_px=128,
-                atlas_sampling_mode="nearest",
-                atlas_sampling_radius_vox=2,
-                atlas_sampling_batch_size=4096,
+                interactive=interactive,
             )
             if atlas_preview_shape != composite_shape:
                 region_map = np.asarray(
@@ -3230,6 +3722,11 @@ class AtlasFittingApp(tk.Tk):
             )
             if state.markers:
                 payload_slice["markers"] = [[float(value) for value in marker] for marker in state.markers]
+            payload_slice[QDF2D_TRANSFORM_KEY] = self._qdf2d_payload_for_state(
+                state,
+                reg_slice.width,
+                reg_slice.height,
+            )
             slices.append(payload_slice)
         payload = {
             "name": path.stem,
@@ -3261,7 +3758,7 @@ class AtlasFittingApp(tk.Tk):
         registration_slice: RegistrationSlice,
         omit_strokes: list[dict[str, object]] | None = None,
     ) -> SliceFitState:
-        return self._state_from_vectors(
+        state = self._state_from_vectors(
             np.asarray(registration_slice.origin, dtype=np.float64),
             np.asarray(registration_slice.u, dtype=np.float64),
             np.asarray(registration_slice.v, dtype=np.float64),
@@ -3269,6 +3766,28 @@ class AtlasFittingApp(tk.Tk):
             omit_strokes=[self._clone_omit_stroke(stroke) for stroke in (omit_strokes or [])],
             registration_width=registration_slice.width,
             registration_height=registration_slice.height,
+        )
+        raw = registration_slice.raw if isinstance(registration_slice.raw, dict) else {}
+        payload = raw.get(QDF2D_TRANSFORM_KEY)
+        if not isinstance(payload, dict):
+            return state
+        base_anchoring = payload.get("base_anchoring")
+        if not isinstance(base_anchoring, list) or len(base_anchoring) < 9:
+            return state
+        base_values = np.asarray(base_anchoring[:9], dtype=np.float64)
+        base_display = payload.get("base_display")
+        if not isinstance(base_display, dict):
+            base_display = {}
+        return replace(
+            state,
+            base_center_ml=float(base_display.get("center_ml", state.center_ml)),
+            base_center_dv=float(base_display.get("center_dv", state.center_dv)),
+            base_span_ml=float(base_display.get("span_ml", state.span_ml)),
+            base_span_dv=float(base_display.get("span_dv", state.span_dv)),
+            base_roll_deg=float(base_display.get("roll_deg", state.roll_deg)),
+            base_origin_vec=tuple(float(value) for value in base_values[0:3]),
+            base_u_vec=tuple(float(value) for value in base_values[3:6]),
+            base_v_vec=tuple(float(value) for value in base_values[6:9]),
         )
 
 
