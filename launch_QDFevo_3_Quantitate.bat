@@ -2,7 +2,7 @@
 setlocal
 
 rem Quint Deep Flow evo launcher.
-rem QDFevo_3_Quantitate launcher v2026.07.22.1
+rem QDFevo_3_Quantitate launcher v2026.07.22.2
 rem If QDF_RUNTIME_ROOT is not set, the launcher tries a local runtime first,
 rem then %USERPROFILE%\Documents\QDF_portable, then the active Python on PATH.
 set "REPO_ROOT=%~dp0"
