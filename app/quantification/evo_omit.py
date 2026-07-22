@@ -29,6 +29,7 @@ from quality_check.core import (
 )
 from quality_check.models import OmitRegionSelection, OmitSessionState, OverlayDataset
 from registration.parser import parse_registration_file
+from quantification.section_summary import build_section_region_summary
 
 
 LOG = logging.getLogger(__name__)
@@ -507,12 +508,16 @@ def _overwrite_tables_with_omit(
     cell_path = output_dir / "cell_level.csv"
     region_path = output_dir / "region_summary.csv"
     section_path = output_dir / "section_summary.csv"
-    if not cell_path.exists() or not region_path.exists() or not section_path.exists():
+    section_channel_path = output_dir / "section_channel_summary.csv"
+    section_input_path = section_channel_path if section_channel_path.exists() else section_path
+    if not cell_path.exists() or not region_path.exists() or not section_input_path.exists():
         return {"omit_tables_updated": False, "reason": "tables_missing"}
 
     cell_df = pd.read_csv(cell_path)
     region_df = pd.read_csv(region_path)
-    section_df = pd.read_csv(section_path)
+    section_df = pd.read_csv(section_input_path)
+    if "pixel_area_um2" not in section_df.columns:
+        return {"omit_tables_updated": False, "reason": "section_channel_summary_missing_pixel_area"}
 
     flagged_cell = _apply_omit_mask_to_cell_level(
         cell_df,
@@ -550,13 +555,16 @@ def _overwrite_tables_with_omit(
 
     flagged_cell.to_csv(cell_path, index=False)
     region_omit.to_csv(region_path, index=False)
-    section_omit.to_csv(section_path, index=False)
+    section_omit.to_csv(section_channel_path, index=False)
+    section_region_omit = build_section_region_summary(region_omit, section_omit)
+    section_region_omit.to_csv(section_path, index=False)
     return {
         "omit_tables_updated": True,
         "cell_level_rows_after_omit": int(len(flagged_cell)),
         "omitted_cell_count": int(flagged_cell["omit_flag"].sum()),
         "region_summary_rows_after_omit": int(len(region_omit)),
-        "section_summary_rows_after_omit": int(len(section_omit)),
+        "section_channel_summary_rows_after_omit": int(len(section_omit)),
+        "section_summary_rows_after_omit": int(len(section_region_omit)),
     }
 
 

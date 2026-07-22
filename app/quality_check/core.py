@@ -13,6 +13,7 @@ import tifffile
 import yaml
 
 from multichannel.matcher import parse_overlap_spec
+from quantification.section_summary import build_section_region_summary
 from quality_check.models import (
     OmitRegionSelection,
     OmitSessionState,
@@ -281,12 +282,16 @@ def _export_omitted_quantification_tables(
     cell_path = results_dir / "cell_level.csv"
     region_path = results_dir / "region_summary.csv"
     section_path = results_dir / "section_summary.csv"
-    if not cell_path.exists() or not region_path.exists() or not section_path.exists():
+    section_channel_path = results_dir / "section_channel_summary.csv"
+    section_input_path = section_channel_path if section_channel_path.exists() else section_path
+    if not cell_path.exists() or not region_path.exists() or not section_input_path.exists():
         return {}
 
     base_cell = pd.read_csv(cell_path)
     base_region = pd.read_csv(region_path)
-    base_section = pd.read_csv(section_path)
+    base_section = pd.read_csv(section_input_path)
+    if "pixel_area_um2" not in base_section.columns:
+        return {}
 
     augmented_cell = _augment_cell_level_with_patch_info(base_cell, dataset)
     filtered_cell, exact_overlap = _apply_omit_to_cell_level(augmented_cell, dataset, session)
@@ -303,13 +308,17 @@ def _export_omitted_quantification_tables(
     cell_out = output_dir / "cell_level_omit.csv"
     region_out = output_dir / "region_summary_omit.csv"
     section_out = output_dir / "section_summary_omit.csv"
+    section_channel_out = output_dir / "section_channel_summary_omit.csv"
+    section_region_omit = build_section_region_summary(region_summary_omit, section_summary_omit)
     filtered_cell.to_csv(cell_out, index=False, encoding="utf-8-sig")
     region_summary_omit.to_csv(region_out, index=False, encoding="utf-8-sig")
-    section_summary_omit.to_csv(section_out, index=False, encoding="utf-8-sig")
+    section_region_omit.to_csv(section_out, index=False, encoding="utf-8-sig")
+    section_summary_omit.to_csv(section_channel_out, index=False, encoding="utf-8-sig")
     return {
         "cell_level_omit": cell_out,
         "region_summary_omit": region_out,
         "section_summary_omit": section_out,
+        "section_channel_summary_omit": section_channel_out,
     }
 
 

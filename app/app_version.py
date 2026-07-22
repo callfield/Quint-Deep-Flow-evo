@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-APP_VERSION = "2026.07.22.1"
+APP_VERSION = "2026.07.22.2"
 
 
 def version_label(app_name: str) -> str:

@@ -56,6 +56,7 @@ from quantification.assignment import assign_object_region
 from quantification.detector import detect_cells
 from quantification.evo_omit import apply_qdf1_evo_omit_to_results
 from quantification.hemisphere import hemisphere_from_ml_um
+from quantification.section_summary import build_section_region_summary
 from registration.nonlinear import build_marker_inverse_warp, build_piecewise_affine_mapper, image_points_to_registration_source
 from registration.parser import match_registration_slice, parse_registration_file
 
@@ -158,7 +159,7 @@ class QuantificationPipeline:
         spool_dir.mkdir(parents=True, exist_ok=True)
         cell_spool = _CsvRowSpool(spool_dir / "cell_level.csv")
         region_spool = _CsvRowSpool(spool_dir / "region_summary.csv")
-        section_spool = _CsvRowSpool(spool_dir / "section_summary.csv")
+        section_spool = _CsvRowSpool(spool_dir / "section_channel_summary.csv")
 
         processing_rows: list[dict[str, object]] = []
         comparison_inputs: list[SectionChannelResult] = []
@@ -237,12 +238,20 @@ class QuantificationPipeline:
         if self.config.comparison.enabled:
             tables["comparison_report.csv"] = comparison_df
 
-        spooled_table_names = {"cell_level.csv", "region_summary.csv", "section_summary.csv"}
+        spooled_table_names = {"cell_level.csv", "region_summary.csv", "section_channel_summary.csv", "section_summary.csv"}
         self._cleanup_obsolete_outputs(output_dir, set(tables) | spooled_table_names, comparison_enabled=self.config.comparison.enabled)
         write_tables(output_dir, tables)
         cell_df = cell_spool.materialize(output_dir / "cell_level.csv")
-        region_df = region_spool.materialize(output_dir / "region_summary.csv")
-        section_df = section_spool.materialize(output_dir / "section_summary.csv")
+        region_spool.materialize(output_dir / "region_summary.csv")
+        section_spool.materialize(output_dir / "section_channel_summary.csv")
+        region_df = pd.read_csv(output_dir / "region_summary.csv") if (output_dir / "region_summary.csv").exists() else pd.DataFrame()
+        section_channel_df = (
+            pd.read_csv(output_dir / "section_channel_summary.csv")
+            if (output_dir / "section_channel_summary.csv").exists()
+            else pd.DataFrame()
+        )
+        section_df = build_section_region_summary(region_df, section_channel_df)
+        section_df.to_csv(output_dir / "section_summary.csv", index=False)
         shutil.rmtree(spool_dir, ignore_errors=True)
         animal_channel_map_paths = self._write_animal_channel_map_workbooks(
             output_dir,
@@ -256,6 +265,10 @@ class QuantificationPipeline:
             )
             if omit_result.get("enabled"):
                 self.logger.info("Applied QDF1 omit import: %s", omit_result)
+                if (output_dir / "region_summary.csv").exists():
+                    region_df = pd.read_csv(output_dir / "region_summary.csv")
+                if (output_dir / "section_summary.csv").exists():
+                    section_df = pd.read_csv(output_dir / "section_summary.csv")
             else:
                 self.logger.info("Skipped QDF1 omit import: %s", omit_result)
         if progress_callback:
