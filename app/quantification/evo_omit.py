@@ -94,11 +94,22 @@ def apply_qdf1_evo_omit_to_results(
 
     logger.info("Importing QDFevo_2_AtlasFitter omit state: %s", omit_state_path)
     dataset = load_overlay_dataset(overlay_dir)
-    omit_masks_by_slice = _omit_masks_from_qdf1_evo_state(dataset, omit_state_path, registration_json_path)
-    session = _session_from_omit_masks(dataset, omit_masks_by_slice)
+    omit_masks_for_tables = _omit_masks_from_qdf1_evo_state(
+        dataset,
+        omit_state_path,
+        registration_json_path,
+        target_space="source",
+    )
+    omit_masks_for_overlay = _resize_masks_to_overlay_space(dataset, omit_masks_for_tables)
+    session = _session_from_omit_masks(dataset, omit_masks_for_overlay)
     omit_rows = build_omit_rows(dataset, session)
-    overlay_update = _write_omit_plane_to_overlay(dataset, omit_masks_by_slice)
-    table_update = _overwrite_tables_with_omit(output_dir, dataset, omit_masks_by_slice)
+    overlay_update = _write_omit_plane_to_overlay(dataset, omit_masks_for_overlay)
+    table_update = _overwrite_tables_with_omit(
+        output_dir,
+        dataset,
+        omit_masks_for_tables,
+        omit_masks_for_overlay,
+    )
 
     report_path = output_dir / "qdf1_atlasfitter_imported_omit_regions.csv"
     pd.DataFrame(omit_rows).to_csv(report_path, index=False)
@@ -127,6 +138,7 @@ def _normalize_filename_key(name: str) -> str:
 
 
 def _registration_image_size_by_name(registration_json_path: Path) -> dict[str, tuple[int, int]]:
+    registration_json_path = Path(registration_json_path)
     registration = parse_registration_file(registration_json_path)
     sizes: dict[str, tuple[int, int]] = {}
     for registration_slice in registration.slices:
@@ -139,17 +151,36 @@ def _registration_image_size_by_name(registration_json_path: Path) -> dict[str, 
     return sizes
 
 
+def _registration_image_size_by_section(registration_json_path: Path) -> dict[str, tuple[int, int]]:
+    registration_json_path = Path(registration_json_path)
+    registration = parse_registration_file(registration_json_path)
+    sizes: dict[str, tuple[int, int]] = {}
+    for registration_slice in registration.slices:
+        try:
+            width = int(registration_slice.width)
+            height = int(registration_slice.height)
+        except (TypeError, ValueError):
+            continue
+        section_id = extract_section_id(str(registration_slice.filename))
+        if section_id:
+            sizes.setdefault(section_id, (width, height))
+    return sizes
+
+
 def _omit_masks_from_qdf1_evo_state(
     dataset: OverlayDataset,
     omit_state_path: Path,
     registration_json_path: Path,
+    *,
+    target_space: str = "source",
 ) -> dict[str, np.ndarray]:
-    """Convert QDFevo_2_AtlasFitter omit strokes into per-slice overlay-space masks."""
+    """Convert QDFevo_2_AtlasFitter omit strokes into per-slice masks."""
 
     with Path(omit_state_path).open("r", encoding="utf-8") as handle:
         raw = json.load(handle) or {}
 
     registration_sizes = _registration_image_size_by_name(registration_json_path)
+    registration_sizes_by_section = _registration_image_size_by_section(registration_json_path)
     slice_entries = raw.get("slices", {}) if isinstance(raw, dict) else {}
     section_to_entries: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for image_name, payload in slice_entries.items():
@@ -163,7 +194,16 @@ def _omit_masks_from_qdf1_evo_state(
         entries = section_to_entries.get(slice_info.section_id, [])
         if not entries:
             continue
-        _, height, width = _overlay_stack_shape(slice_info.overlay_path)
+        _, overlay_height, overlay_width = _overlay_stack_shape(slice_info.overlay_path)
+        if target_space == "source":
+            width, height = registration_sizes_by_section.get(
+                slice_info.section_id,
+                (overlay_width, overlay_height),
+            )
+        elif target_space == "overlay":
+            width, height = overlay_width, overlay_height
+        else:
+            raise ValueError(f"Unknown omit mask target_space: {target_space}")
         combined_mask = np.zeros((height, width), dtype=bool)
         for image_name, payload in entries:
             strokes = payload.get("omit_strokes", [])
@@ -184,6 +224,29 @@ def _omit_masks_from_qdf1_evo_state(
                 combined_mask |= stroke_mask
         omit_masks_by_slice[slice_info.key] = combined_mask
     return omit_masks_by_slice
+
+
+def _resize_bool_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    target_height, target_width = int(shape[0]), int(shape[1])
+    if mask.shape == (target_height, target_width):
+        return np.asarray(mask, dtype=bool)
+    image = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255, mode="L")
+    resized = image.resize((target_width, target_height), resample=Image.Resampling.NEAREST)
+    return np.asarray(resized, dtype=np.uint8) > 0
+
+
+def _resize_masks_to_overlay_space(
+    dataset: OverlayDataset,
+    omit_masks_by_slice: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    resized_masks: dict[str, np.ndarray] = {}
+    for slice_info in dataset.slices:
+        mask = omit_masks_by_slice.get(slice_info.key)
+        if mask is None:
+            continue
+        _, height, width = _overlay_stack_shape(slice_info.overlay_path)
+        resized_masks[slice_info.key] = _resize_bool_mask(mask, (height, width))
+    return resized_masks
 
 
 def _resolve_omit_mask_file(payload: dict[str, Any], omit_state_path: Path) -> Path | None:
@@ -213,11 +276,17 @@ def _omit_mask_file_mask(
     mask_path = _resolve_omit_mask_file(payload, omit_state_path)
     if mask_path is None:
         return None
-    with Image.open(mask_path) as image:
-        mask_image = image.convert("L")
-        if mask_image.size != (int(width), int(height)):
-            mask_image = mask_image.resize((int(width), int(height)), resample=Image.Resampling.NEAREST)
-        return np.asarray(mask_image, dtype=np.uint8) > 0
+    try:
+        if mask_path.stat().st_size <= 0:
+            return None
+        with Image.open(mask_path) as image:
+            mask_image = image.convert("L")
+            if mask_image.size != (int(width), int(height)):
+                mask_image = mask_image.resize((int(width), int(height)), resample=Image.Resampling.NEAREST)
+            return np.asarray(mask_image, dtype=np.uint8) > 0
+    except Exception:
+        LOG.warning("Ignoring unreadable omit mask file and falling back to strokes: %s", mask_path)
+        return None
 
 
 def _session_from_omit_masks(
@@ -431,6 +500,7 @@ def _overwrite_tables_with_omit(
     output_dir: Path,
     dataset: OverlayDataset,
     omit_masks_by_slice: dict[str, np.ndarray],
+    overlay_omit_masks_by_slice: dict[str, np.ndarray],
 ) -> dict[str, object]:
     """Overwrite main QDF2 tables using mask-based omit logic."""
 
@@ -444,7 +514,12 @@ def _overwrite_tables_with_omit(
     region_df = pd.read_csv(region_path)
     section_df = pd.read_csv(section_path)
 
-    flagged_cell = _apply_omit_mask_to_cell_level(cell_df, dataset, omit_masks_by_slice)
+    flagged_cell = _apply_omit_mask_to_cell_level(
+        cell_df,
+        dataset,
+        omit_masks_by_slice,
+        overlay_omit_masks_by_slice,
+    )
     active_cell = flagged_cell.loc[flagged_cell["omit_flag"].eq(0)].copy()
     exact_overlap = (
         "overlap_group_id" in active_cell.columns
@@ -468,6 +543,7 @@ def _overwrite_tables_with_omit(
         region_df,
         section_omit,
         dataset,
+        output_dir,
         omit_masks_by_slice,
         exact_overlap=bool(exact_overlap),
     )
@@ -525,6 +601,7 @@ def _apply_omit_mask_to_cell_level(
     cell_df: pd.DataFrame,
     dataset: OverlayDataset,
     omit_masks_by_slice: dict[str, np.ndarray],
+    overlay_omit_masks_by_slice: dict[str, np.ndarray],
 ) -> pd.DataFrame:
     """Flag cells whose ROI overlaps the omit mask, preserving all cell rows."""
 
@@ -547,6 +624,7 @@ def _apply_omit_mask_to_cell_level(
         omit_mask = np.asarray(omit_masks_by_slice.get(slice_info.key), dtype=bool) if slice_info.key in omit_masks_by_slice else None
         if omit_mask is None or not np.any(omit_mask):
             continue
+        overlay_omit_mask = overlay_omit_masks_by_slice.get(slice_info.key)
 
         section_frame = working.loc[pd.Index(index_labels)]
 
@@ -569,8 +647,16 @@ def _apply_omit_mask_to_cell_level(
                 roi_plane = None
             if roi_plane is not None:
                 labels, _ = ndimage.label(roi_plane, structure=np.ones((3, 3), dtype=np.uint8))
-                component_labels = _sample_component_labels(labels, x, y)
-                touched_components = np.unique(labels[omit_mask])
+                if overlay_omit_mask is None or overlay_omit_mask.shape != labels.shape:
+                    overlay_mask_for_roi = _resize_bool_mask(omit_mask, labels.shape)
+                else:
+                    overlay_mask_for_roi = overlay_omit_mask
+                scale_x = float(labels.shape[1]) / float(max(1, omit_mask.shape[1]))
+                scale_y = float(labels.shape[0]) / float(max(1, omit_mask.shape[0]))
+                roi_x = np.rint(x.astype(np.float64) * scale_x).astype(np.int32)
+                roi_y = np.rint(y.astype(np.float64) * scale_y).astype(np.int32)
+                component_labels = _sample_component_labels(labels, roi_x, roi_y)
+                touched_components = np.unique(labels[overlay_mask_for_roi])
                 touched_components = touched_components[touched_components > 0]
                 if touched_components.size:
                     component_touched = np.zeros(int(touched_components.max()) + 1, dtype=bool)
@@ -616,36 +702,77 @@ def _build_section_summary_with_omit(
     return output.reindex(columns=list(base_section.columns))
 
 
+def _load_registered_maps_for_slice(
+    output_dir: Path,
+    slice_info,
+    target_shape: tuple[int, int] | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    cache_root = Path(output_dir) / "atlas_cache" / "registered_sections"
+    section_dir = cache_root / str(slice_info.animal_id)
+    candidates = sorted(
+        section_dir.glob(f"{slice_info.animal_id}_{slice_info.section_id}_*.npz"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        candidates = sorted(
+            cache_root.rglob(f"{slice_info.animal_id}_{slice_info.section_id}_*.npz"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+    for candidate in candidates:
+        try:
+            with np.load(candidate) as payload:
+                region_map = np.asarray(payload["region_map"], dtype=np.uint32)
+                hemisphere_map = np.asarray(payload["hemisphere_map"], dtype=np.int8)
+        except Exception:
+            LOG.warning("Ignoring unreadable registered atlas cache: %s", candidate)
+            continue
+        if target_shape is not None and tuple(region_map.shape) != tuple(target_shape):
+            continue
+        return region_map, hemisphere_map
+    return None
+
+
 def _remaining_region_area_lookup_from_masks(
+    output_dir: Path,
     dataset: OverlayDataset,
     omit_masks_by_slice: dict[str, np.ndarray],
     pixel_area_lookup: dict[tuple[str, str], float],
 ) -> dict[tuple[str, str], dict[tuple[int, str], float]]:
     """Return remaining atlas area after subtracting omit mask pixels only."""
 
-    cache: dict[str, dict[str, Any]] = {}
     area_lookup_by_section: dict[tuple[str, str], dict[tuple[int, str], float]] = {}
     for slice_info in dataset.slices:
         pixel_area_um2 = float(pixel_area_lookup.get((slice_info.animal_id, slice_info.section_id), 0.0))
-        context = _slice_context(dataset, slice_info, cache)
-        atlas_plane = np.asarray(context["atlas_plane"], dtype=np.int64)
-        omit_mask = np.asarray(omit_masks_by_slice.get(slice_info.key, np.zeros(atlas_plane.shape, dtype=bool)), dtype=bool)
-        remaining_codes = atlas_plane[(atlas_plane != 0) & ~omit_mask]
+        raw_omit_mask = np.asarray(omit_masks_by_slice.get(slice_info.key), dtype=bool) if slice_info.key in omit_masks_by_slice else None
+        target_shape = tuple(raw_omit_mask.shape) if raw_omit_mask is not None else None
+        registered_maps = _load_registered_maps_for_slice(output_dir, slice_info, target_shape=target_shape)
+        if registered_maps is None and target_shape is not None:
+            registered_maps = _load_registered_maps_for_slice(output_dir, slice_info, target_shape=None)
+        if registered_maps is None:
+            LOG.warning("Registered atlas cache missing for omit area calculation: %s %s", slice_info.animal_id, slice_info.section_id)
+            continue
+        region_map, hemisphere_map = registered_maps
+        if raw_omit_mask is None:
+            omit_mask = np.zeros(region_map.shape, dtype=bool)
+        elif raw_omit_mask.shape != region_map.shape:
+            omit_mask = _resize_bool_mask(raw_omit_mask, region_map.shape)
+        else:
+            omit_mask = raw_omit_mask
+        valid_region = (region_map > 0) & ~omit_mask
+        remaining_codes = region_map[valid_region]
+        remaining_hemispheres = hemisphere_map[valid_region]
         lookup: dict[tuple[int, str], float] = {}
         if remaining_codes.size:
-            display_codes, total_counts = np.unique(remaining_codes, return_counts=True)
-            for display_code, count in zip(display_codes, total_counts, strict=False):
-                code = int(display_code)
-                region_info = dataset.region_lookup.get(code)
-                region_id = int(region_info.region_id) if region_info is not None else abs(code)
-                total_key = (int(region_id), "total")
-                lookup[total_key] = lookup.get(total_key, 0.0) + (float(count) * pixel_area_um2)
-                hemisphere_name = str(region_info.hemisphere).lower() if region_info is not None else (
-                    "left" if code < 0 else "right"
-                )
-                if hemisphere_name in {"left", "right"}:
-                    key = (int(region_id), hemisphere_name)
-                    lookup[key] = lookup.get(key, 0.0) + (float(count) * pixel_area_um2)
+            region_ids, total_counts = np.unique(remaining_codes, return_counts=True)
+            for region_id, count in zip(region_ids, total_counts, strict=False):
+                lookup[(int(region_id), "total")] = float(count) * pixel_area_um2
+            for hemisphere_name, hemisphere_code in (("left", -1), ("right", 1)):
+                mask = remaining_hemispheres == hemisphere_code
+                region_ids, counts = np.unique(remaining_codes[mask], return_counts=True)
+                for region_id, count in zip(region_ids, counts, strict=False):
+                    lookup[(int(region_id), hemisphere_name)] = float(count) * pixel_area_um2
         area_lookup_by_section[(slice_info.animal_id, slice_info.section_id)] = lookup
     return area_lookup_by_section
 
@@ -655,6 +782,7 @@ def _build_region_summary_with_omit_masks(
     base_region: pd.DataFrame,
     section_summary: pd.DataFrame,
     dataset: OverlayDataset,
+    output_dir: Path,
     omit_masks_by_slice: dict[str, np.ndarray],
     *,
     exact_overlap: bool,
@@ -674,7 +802,7 @@ def _build_region_summary_with_omit_masks(
         .set_index(["animal_id", "section_id"])["pixel_area_um2"]
         .to_dict()
     )
-    area_lookup_by_section = _remaining_region_area_lookup_from_masks(dataset, omit_masks_by_slice, pixel_area_lookup)
+    area_lookup_by_section = _remaining_region_area_lookup_from_masks(output_dir, dataset, omit_masks_by_slice, pixel_area_lookup)
     empty_frame = active_cell_df.iloc[0:0].copy()
     section_groups = {
         (str(animal_id), str(section_id)): frame.copy()
@@ -708,7 +836,12 @@ def _build_region_summary_with_omit_masks(
         row["total_integrated_intensity"] = float(group["integrated_intensity"].sum()) if not group.empty else 0.0
         row["mean_integrated_intensity"] = float(group["mean_intensity"].mean()) if not group.empty else None
         row["mean_cell_area"] = float(group["area_px"].mean()) if not group.empty else None
-        area_um2 = float(area_lookup_by_section.get((animal_id, section_id), {}).get((region_id, hemisphere), 0.0))
+        area_um2 = float(
+            area_lookup_by_section.get((animal_id, section_id), {}).get(
+                (region_id, hemisphere),
+                record.get("region_area_um2", 0.0),
+            )
+        )
         row["region_area_um2"] = area_um2
         row["density_if_possible"] = float(len(group) / (area_um2 / 1_000_000.0)) if area_um2 > 0 and len(group) > 0 else None
         patch_summary = _region_patch_summary_from_frame(group)
